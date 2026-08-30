@@ -96,16 +96,35 @@ end
 local function get_missing_trust()
     local party = windower.ffxi.get_party()
     if party.p5 then return false end
+    
     local spellrecasts = windower.ffxi.get_spell_recasts()
-
+    local known_spells = windower.ffxi.get_spells() -- Checks to see if you actually own the spell
+    
     for _, t_info in ipairs(trust_list) do
         local found = false
+        -- Check if either the primary or alt is already in the party
         for i, v in pairs(party) do
-            if string.match(i, 'p[0-5]') and v.mob and (v.mob.name == t_info.spell or v.mob.name == t_info.alt) then found = true break end
+            if string.match(i, 'p[0-5]') and v.mob and (v.mob.name == t_info.spell or v.mob.name == t_info.alt) then 
+                found = true 
+                break 
+            end
         end
+        
+        -- If neither is in the party, try to cast them
         if not found then
-            local spell_data = res.spells:with('en', t_info.spell)
-            if spell_data and spellrecasts[spell_data.recast_id] == 0 then return t_info.spell end
+            -- Try primary Trust first
+            local primary_data = res.spells:with('en', t_info.spell)
+            if primary_data and known_spells[primary_data.id] and spellrecasts[primary_data.recast_id] == 0 then 
+                return t_info.spell 
+            end
+            
+            -- If primary fails (not known or on cooldown), try the Alt Trust
+            if t_info.alt and t_info.alt ~= '' then
+                local alt_data = res.spells:with('en', t_info.alt)
+                if alt_data and known_spells[alt_data.id] and spellrecasts[alt_data.recast_id] == 0 then
+                    return t_info.alt
+                end
+            end
         end
     end
     return false
