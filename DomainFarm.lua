@@ -1,10 +1,11 @@
 _addon.author   = 'Zforninja'
-_addon.version  = '8.2'
+_addon.version  = '8.6'
 _addon.commands = {'domainfarm', 'DomainFarm'}
 
 require 'logger'
 require 'strings'
 require('coroutine')
+require('texts') -- Required for HUD
 packets = require('packets')
 res = require('resources')
 
@@ -18,12 +19,52 @@ local elvorseal_timer = 0
 local arena_positioned = false
 
 -- 1: Reisenjima (Quetz), 2: Escha-Zi'Tah (Azi), 3: Escha-Ru'Aun (Naga)
-local current_zone_index = 1
-local bot_phase = 0
+local current_zone_index = 1 
+local bot_phase = 0 
 local waypoint_index = 1
 
 local teleport_ring = "Dim. Ring (Dem)"
 local warp_ring = "Warp Ring"
+
+-- ==========================================
+-- HUD CONFIGURATION
+-- ==========================================
+local hud_settings = {
+    pos = {x = 10, y = 10},
+    bg = {alpha = 200, red = 0, green = 0, blue = 0},
+    text = {size = 10, font = 'Consolas', stroke = {width = 1, alpha = 255, red = 0, green = 0, blue = 0}},
+    flags = {bold = true, draggable = true}
+}
+local hud = texts.new(hud_settings)
+hud:show()
+
+local zone_names = {
+    [1] = "Reisenjima (Quetzalcoatl)",
+    [2] = "Escha - Zi'Tah (Azi Dahaka)",
+    [3] = "Escha - Ru'Aun (Naga Raja)"
+}
+
+local phase_names = {
+    [0] = "Idle",
+    [1] = "Equipping Teleport Ring",
+    [2] = "Navigating to Reisenjima Portal",
+    [3] = "Pathing to Elvorseal NPC",
+    [4] = "Requesting Elvorseal (Superwarp)",
+    [5] = "Verifying Elvorseal Buff",
+    [6] = "Arena Combat / Wait",
+    [7] = "Equipping Warp Ring",
+    [8] = "Safe Zone - Warping to Conflux",
+    [9] = "Pathing to Escha Conflux",
+    [10] = "Entering Escha Zone"
+}
+
+local function update_hud()
+    local status_text = pause == 'on' and "\\cs(255,100,100)[PAUSED]\\cr" or "\\cs(100,255,100)[RUNNING]\\cr"
+    local target_text = "\\cs(100,200,255)" .. (zone_names[current_zone_index] or "None") .. "\\cr"
+    local action_text = "\\cs(255,255,100)" .. (phase_names[bot_phase] or "Idle") .. "\\cr"
+    
+    hud:text('  DomainFarm ' .. status_text .. '  \n  Target: ' .. target_text .. '  \n  Action: ' .. action_text .. '  ')
+end
 
 -- Town/Safe Zones for Auto-Correction
 local safe_zones = {
@@ -35,13 +76,13 @@ local safe_zones = {
     ['Windurst Waters']=true, ['Windurst Walls']=true, ['Port Windurst']=true, ['Windurst Woods']=true
 }
 
--- Waypoint Paths (Zone Navigation)
+-- Waypoint Paths
 local q_waypoints = { {x = -212.00, y = 94.00}, {x = -207.61, y = 88.76}, {x = -203.64, y = 84.19}, {x = -201.26, y = 81.52}, {x = -203.09, y = 77.94} }
 local m_waypoints = { {x = -66.00, y = 562.00}, {x = -65.22, y = 565.10}, {x = -63.39, y = 568.49}, {x = -60.10, y = 570.39}, {x = -56.77, y = 569.21}, {x = -52.69, y = 567.83}, {x = -50.37, y = 567.07}, {x = -49.57, y = 570.27} }
 local zitah_waypoints = { {x = -345.43, y = -178.93}, {x = -349.69, y = -175.19}, {x = -353.34, y = -171.91}, {x = -355.45, y = -171.26} }
 local ruaun_waypoints = { {x = -0.37, y = -466.98}, {x = -4.43, y = -463.94}, {x = -9.29, y = -460.63} }
 
--- Waypoint Paths (Arena Flanking)
+-- Arena Flanking Paths
 local zitah_arena_wps = { {x = -6.77, y = 52.33}, {x = -7.74, y = 44.74}, {x = -8.40, y = 39.76}, {x = -9.19, y = 33.85} }
 local ruaun_arena_wps = { {x = 2.25, y = -223.03}, {x = 5.04, y = -217.67}, {x = 6.67, y = -212.86}, {x = 8.38, y = -211.61} }
 
@@ -89,7 +130,7 @@ local function process_ring(ring_name)
         delay = 4
     else
         windower.send_command('input /item "'..ring_name..'" <me>')
-        delay = 15 -- Wait 15s to allow for casting time and zone out
+        delay = 15 -- Ring cast time + wait for zone. Auto-retries if interrupted.
     end
 end
 
@@ -98,11 +139,10 @@ local function get_missing_trust()
     if party.p5 then return false end
     
     local spellrecasts = windower.ffxi.get_spell_recasts()
-    local known_spells = windower.ffxi.get_spells() -- Checks to see if you actually own the spell
+    local known_spells = windower.ffxi.get_spells()
     
     for _, t_info in ipairs(trust_list) do
         local found = false
-        -- Check if either the primary or alt is already in the party
         for i, v in pairs(party) do
             if string.match(i, 'p[0-5]') and v.mob and (v.mob.name == t_info.spell or v.mob.name == t_info.alt) then 
                 found = true 
@@ -110,15 +150,12 @@ local function get_missing_trust()
             end
         end
         
-        -- If neither is in the party, try to cast them
         if not found then
-            -- Try primary Trust first
             local primary_data = res.spells:with('en', t_info.spell)
             if primary_data and known_spells[primary_data.id] and spellrecasts[primary_data.recast_id] == 0 then 
                 return t_info.spell 
             end
             
-            -- If primary fails (not known or on cooldown), try the Alt Trust
             if t_info.alt and t_info.alt ~= '' then
                 local alt_data = res.spells:with('en', t_info.alt)
                 if alt_data and known_spells[alt_data.id] and spellrecasts[alt_data.recast_id] == 0 then
@@ -130,10 +167,20 @@ local function get_missing_trust()
     return false
 end
 
+-- Custom mob finder to bypass invisible placeholder/dummy indices
+local function get_dragon(mob_name)
+    for _, mob in pairs(windower.ffxi.get_mob_array()) do
+        if mob.name == mob_name and mob.valid_target then
+            return mob
+        end
+    end
+    return nil
+end
+
 local function executePath(waypoints, target_phase)
     local me = windower.ffxi.get_mob_by_target('me')
     if not me then return end
-
+    
     local wp = waypoints[waypoint_index]
     if not wp then
         windower.ffxi.run(false)
@@ -142,7 +189,7 @@ local function executePath(waypoints, target_phase)
         delay = 3
         return
     end
-
+    
     local dist = math.sqrt((wp.x - me.x)^2 + (wp.y - me.y)^2)
     if dist > 2 then
         windower.ffxi.run(wp.x - me.x, wp.y - me.y)
@@ -155,13 +202,13 @@ end
 local function executeArenaPath(waypoints)
     local me = windower.ffxi.get_mob_by_target('me')
     if not me then return false end
-
+    
     local wp = waypoints[waypoint_index]
     if not wp then
         windower.ffxi.run(false)
-        return true -- Path complete
+        return true
     end
-
+    
     local dist = math.sqrt((wp.x - me.x)^2 + (wp.y - me.y)^2)
     if dist > 2 then
         windower.ffxi.run(wp.x - me.x, wp.y - me.y)
@@ -174,11 +221,13 @@ local function executeArenaPath(waypoints)
 end
 
 windower.register_event('prerender', function()
+    update_hud() -- Update the display text every tick
+    
     local curtime = os.clock()
     if nexttime + delay > curtime or pause == 'on' then return end
     nexttime = curtime
     delay = 0.2
-
+    
     local info = windower.ffxi.get_info()
     if not info or not info.zone then return end
     local zone_name = res.zones[info.zone].name
@@ -186,48 +235,29 @@ windower.register_event('prerender', function()
     if not player then return end
 
     -- ==========================================
-    -- SELF-HEALING STATE MACHINE (AUTO-CORRECT)
+    -- STRICT SELF-HEALING ENFORCEMENT
     -- ==========================================
-    if bot_phase == 1 or bot_phase == 2 then
-        if zone_name == 'La Theine Plateau' or zone_name == 'Konschtat Highlands' or zone_name == 'Tahrongi Canyon' then
-            bot_phase = 2
-        elseif zone_name == 'Reisenjima' then
-            if bot_phase == 2 then windower.ffxi.run(false) end -- Stops running if transitioning from crag
-            bot_phase = 4
+    if safe_zones[zone_name] then
+        -- Only phases 1, 7, and 8 are allowed in safe zones
+        if bot_phase > 1 and bot_phase < 7 then
+            log('Detected safe zone. Auto-correcting mismatched phase...')
+            fighting = false
+            if current_zone_index == 1 then bot_phase = 1 else bot_phase = 8 end
         end
-    elseif bot_phase == 7 or bot_phase == 8 then
-        if current_zone_index == 2 then
-            if zone_name == 'Qufim Island' then
-                bot_phase = 9
-                waypoint_index = 1
-            elseif zone_name == 'Escha - Zi\'Tah' then
-                bot_phase = 3
-                waypoint_index = 1
-            elseif safe_zones[zone_name] and bot_phase == 7 then
-                log('In safe zone. Skipping Warp Ring, using Superwarp to Qufim.')
-                windower.send_command('sw qufim')
-                bot_phase = 8
-                delay = 8
-            end
-        elseif current_zone_index == 3 then
-            if zone_name == 'Misareaux Coast' then
-                bot_phase = 9
-                waypoint_index = 1
-            elseif zone_name == 'Escha - Ru\'Aun' then
-                bot_phase = 3
-                waypoint_index = 1
-            elseif safe_zones[zone_name] and bot_phase == 7 then
-                log('In safe zone. Skipping Warp Ring, using Superwarp to Misareaux.')
-                windower.send_command('sw misareaux')
-                bot_phase = 8
-                delay = 8
-            end
-        end
-    elseif bot_phase == 10 then
-        if current_zone_index == 2 and zone_name == 'Escha - Zi\'Tah' then
+    elseif zone_name == 'Qufim Island' or zone_name == 'Misareaux Coast' then
+        if bot_phase ~= 8 and bot_phase ~= 9 and bot_phase ~= 10 then
             waypoint_index = 1
-            bot_phase = 3
-        elseif current_zone_index == 3 and zone_name == 'Escha - Ru\'Aun' then
+            bot_phase = 9
+        end
+    elseif zone_name == 'La Theine Plateau' or zone_name == 'Konschtat Highlands' or zone_name == 'Tahrongi Canyon' then
+        if bot_phase ~= 2 then bot_phase = 2 end
+    elseif zone_name == 'Reisenjima' then
+        if bot_phase == 1 or bot_phase == 2 then 
+            windower.ffxi.run(false)
+            bot_phase = 4 
+        end
+    elseif zone_name == 'Escha - Zi\'Tah' or zone_name == 'Escha - Ru\'Aun' then
+        if bot_phase == 8 or bot_phase == 9 or bot_phase == 10 or bot_phase < 3 or bot_phase > 7 then
             waypoint_index = 1
             bot_phase = 3
         end
@@ -236,11 +266,11 @@ windower.register_event('prerender', function()
     -- ==========================================
     -- PHASE EXECUTION
     -- ==========================================
-
+    
     -- Phase 1: Equipping and casting Teleport Ring to reset for Reisenjima
     if bot_phase == 1 then
         process_ring(teleport_ring)
-
+        
     -- Phase 2: At Crag, navigating to Reisenjima Portal
     elseif bot_phase == 2 then
         local me = windower.ffxi.get_mob_by_target('me')
@@ -270,8 +300,8 @@ windower.register_event('prerender', function()
     elseif bot_phase == 5 then
         if isBuffActive(603) then
             bot_phase = 6
-            arena_positioned = false
-            waypoint_index = 1
+            arena_positioned = false 
+            waypoint_index = 1       
         elseif os.clock() - elvorseal_timer > 10 then
             log('Elvorseal rejected or on cooldown. Retrying in 60 seconds.')
             delay = 60
@@ -280,30 +310,21 @@ windower.register_event('prerender', function()
 
     -- Phase 6: Arena Fighting & Buffing
     elseif bot_phase == 6 then
-        if not isBuffActive(603) then
-            if player.status > 1 then
-                delay = 30
-                packets.inject(packets.new('outgoing', 0x01A, { ['Target'] = player.id, ['Target Index'] = player.index, ['Category'] = 0x0D }))
-            else
-                bot_phase = 4 -- Buff dropped without death, fallback to NPC
-            end
-            return
-        end
-
         local mob_name = "Quetzalcoatl"
         if current_zone_index == 2 then mob_name = "Azi Dahaka"
         elseif current_zone_index == 3 then mob_name = "Naga Raja" end
-
-        local target_mob = windower.ffxi.get_mob_by_name(mob_name)
-
-        -- Kill Confirmed Loop (Ignores invisible dummy spawns)
-        if target_mob and target_mob.valid_target and target_mob.hpp > 0 then
+        
+        -- Safely bypasses invisible dummy spawns
+        local target_mob = get_dragon(mob_name)
+        
+        -- Kill Confirmed Loop
+        if target_mob and target_mob.hpp > 0 then
             fighting = true
         elseif fighting then
             fighting = false
             windower.ffxi.run(false)
-            log(mob_name .. ' defeated.')
-
+            log(mob_name .. ' defeated or despawned.')
+            
             if current_zone_index == 1 then
                 current_zone_index = 2
                 bot_phase = 7
@@ -317,10 +338,23 @@ windower.register_event('prerender', function()
             return
         end
 
+        -- Elvorseal Buff Check & Instant Death Handler
+        if not isBuffActive(603) then
+            fighting = false 
+            if player.status > 1 then
+                log('Player died. Returning to Home Point to reset the loop...')
+                delay = 8 -- 8 seconds gives the client time to register the death animation
+                packets.inject(packets.new('outgoing', 0x01A, { ['Target'] = player.id, ['Target Index'] = player.index, ['Category'] = 0x0D }))
+            else
+                bot_phase = 4
+            end
+            return
+        end
+
         -- Pre-Fight Trust Summoning & Positioning
         if not fighting and player.status == 0 then
             local me = windower.ffxi.get_mob_by_target('me')
-
+            
             if current_zone_index == 1 and (math.abs(612.17 - me.x) > 2 or math.abs(-933.43 - me.y) > 2) then
                 windower.ffxi.run(612.17 - me.x, -933.43 - me.y)
             elseif current_zone_index == 2 and not arena_positioned then
@@ -328,7 +362,7 @@ windower.register_event('prerender', function()
             elseif current_zone_index == 3 and not arena_positioned then
                 arena_positioned = executeArenaPath(ruaun_arena_wps)
             else
-                windower.ffxi.run(false)
+                windower.ffxi.run(false) 
                 local next_trust = get_missing_trust()
                 if next_trust and can_act() then
                     windower.send_command('input /ma "'..next_trust..'" <me>')
@@ -342,7 +376,7 @@ windower.register_event('prerender', function()
             local engage = packets.new('outgoing', 0x01A, { ['Target'] = target_mob.id, ['Target Index'] = target_mob.index, ['Category'] = 0x02 })
             packets.inject(engage)
             delay = 1
-        elseif target_mob and target_mob.valid_target and math.sqrt(target_mob.distance) > 7 and player.status == 1 and fighting then
+        elseif target_mob and math.sqrt(target_mob.distance) > 7 and player.status == 1 and fighting then
             local target = windower.ffxi.get_mob_by_index(player.target_index or 0)
             local self_vector = windower.ffxi.get_mob_by_index(player.index or 0)
             if target and self_vector then
@@ -350,7 +384,7 @@ windower.register_event('prerender', function()
                 windower.ffxi.turn((angle):radian())
                 windower.ffxi.run(true)
             end
-        elseif target_mob and target_mob.valid_target and math.sqrt(target_mob.distance) <= 7 and player.status == 1 and fighting then
+        elseif target_mob and math.sqrt(target_mob.distance) <= 7 and player.status == 1 and fighting then
             windower.ffxi.run(false)
             if not windower.ffxi.get_party().p5 then
                 local next_trust = get_missing_trust()
@@ -364,17 +398,31 @@ windower.register_event('prerender', function()
     -- Phase 7: Equipping and casting Warp Ring
     elseif bot_phase == 7 then
         process_ring(warp_ring)
-
+        
+    -- Phase 8: Waiting in Safe Zone to Superwarp to Confluxes
+    elseif bot_phase == 8 then
+        if safe_zones[zone_name] then
+            if current_zone_index == 2 then windower.send_command('sw qufim')
+            elseif current_zone_index == 3 then windower.send_command('sw misareaux') end
+            delay = 10 -- Retry command every 10s if we fail to zone
+        end
+        
     -- Phase 9: Pathing to Escha Conflux
     elseif bot_phase == 9 then
         if current_zone_index == 2 then executePath(q_waypoints, 10)
         elseif current_zone_index == 3 then executePath(m_waypoints, 10) end
+        
+    -- Phase 10: Waiting to enter Escha Zone via Superwarp
+    elseif bot_phase == 10 then
+        if zone_name == 'Qufim Island' or zone_name == 'Misareaux Coast' then
+            windower.send_command('sw')
+            delay = 10 -- Retry command every 10s if we fail to zone
+        end
     end
 end)
 
 windower.register_event('zone change', function(new_id, old_id)
-    -- Simply pause the script for 8 seconds when zoning so the client has time to load
-    -- The Self-Healing prerender block will instantly detect the new zone and advance the bot_phase naturally
+    -- Pauses script to allow client resources to load. Self-healing detects the new zone.
     delay = 8
 end)
 
@@ -387,7 +435,7 @@ windower.register_event('incoming chunk', function(id, data)
                 local zone_id = windower.ffxi.get_info().zone
                 local zone_name = res.zones[zone_id].name
                 local menu_id = (zone_name == 'La Theine Plateau') and 222 or 926
-
+                
                 packets.inject(packets.new('outgoing', 0x05B, { ["Target"] = tp.id, ["Option Index"] = 0, ["Target Index"] = tp.index, ["Automated Message"] = true, ["Zone"] = zone_id, ["Menu ID"] = menu_id }))
                 packets.inject(packets.new('outgoing', 0x05B, { ["Target"] = tp.id, ["Option Index"] = 2, ["Target Index"] = tp.index, ["Automated Message"] = false, ["Zone"] = zone_id, ["Menu ID"] = menu_id }))
             end
@@ -407,7 +455,7 @@ windower.register_event('addon command', function(...)
         pause = 'off'
         arena_positioned = false
         waypoint_index = 1
-
+        
         if command[2] and string.lower(command[2]) == 'zitah' then
             current_zone_index = 2
             bot_phase = 7
@@ -421,9 +469,13 @@ windower.register_event('addon command', function(...)
             bot_phase = 1
             log('Starting at Quetzalcoatl (Reisenjima). Self-healing module will detect zone...')
         end
-
+        
     elseif command[1] == 'mark' then
         local me = windower.ffxi.get_mob_by_target('me')
         log('Waypoint: {x = ' .. string.format("%.2f", me.x) .. ', y = ' .. string.format("%.2f", me.y) .. '}')
     end
+end)
+
+windower.register_event('unload', function()
+    if hud then hud:destroy() end
 end)
