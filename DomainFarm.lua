@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v10.3 (hardened rewrite)
+    DomainFarm v10.4 (hardened rewrite)
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -36,7 +36,7 @@
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '10.3'
+_addon.version  = '10.4'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -50,7 +50,9 @@ local texts_success, texts = pcall(require, 'texts')
 -- CONFIGURATION
 -- ==========================================================================
 local settings = {
-    teleport_ring   = 'Dim. Ring (Dem)',   -- ring that reaches the Dimensional Portal zone
+    -- Any Dimensional Ring works — all three crags have a Dimensional Portal.
+    -- The bot checks inventory for each ring in order and uses the first one found.
+    teleport_rings  = {'Dim. Ring (Dem)', 'Dim. Ring (Holla)', 'Dim. Ring (Mea)'},
     warp_ring       = 'Warp Ring',
     -- Superwarp command strings (adjust if your Superwarp version differs)
     sw_elvorseal    = 'sw ew domain',      -- request Elvorseal at the eschan portal
@@ -218,6 +220,7 @@ local state = {
     elvorseal_fails    = 0,
     ring_started_at    = nil,          -- os.time() when the current ring phase began
     ring_equip_sent    = false,
+    selected_tp_ring   = nil,          -- which Dim. Ring was picked for this cycle
     phase_started_at   = os.time(),    -- watchdog anchor
     death_latched      = false,        -- home-point packet sent once per death
     sw_attempts        = 0,            -- superwarp retry counter for phases 8/10
@@ -451,6 +454,15 @@ local function item_in_inventory(name)
         end
     end
     return false
+end
+
+-- Search the teleport_rings list for the first ring present in inventory.
+-- Returns the ring name or nil if none found.
+local function find_teleport_ring()
+    for _, name in ipairs(settings.teleport_rings) do
+        if item_in_inventory(name) then return name end
+    end
+    return nil
 end
 
 -- Equip (if needed) then use an enchanted ring. Bounded by ring_timeout.
@@ -794,6 +806,7 @@ local function advance_rotation()
         set_phase(7)
     else
         state.zone_index = 1
+        state.selected_tp_ring = nil   -- re-scan rings next cycle (charges may have changed)
         set_phase(1)
     end
     reset_arena_tracking()
@@ -1082,7 +1095,18 @@ windower.register_event('prerender', function()
     state.hud_note = nil
 
     local p = state.phase
-    if     p == 1  then process_ring(settings.teleport_ring)
+    if     p == 1  then
+        -- Pick the first available Dim. Ring on this cycle (cached in state).
+        if not state.selected_tp_ring then
+            state.selected_tp_ring = find_teleport_ring()
+            if not state.selected_tp_ring then
+                stop_bot('No Dimensional Ring found in inventory (checked: '
+                         .. table.concat(settings.teleport_rings, ', ') .. '). Bot stopped.')
+                return
+            end
+            log('Using ' .. state.selected_tp_ring .. ' for this cycle.')
+        end
+        process_ring(state.selected_tp_ring)
     elseif p == 2  then phase_2_portal()
     elseif p == 3  then
         if     state.zone_index == 2 then executePath(zitah_waypoints, 4)
@@ -1186,6 +1210,7 @@ local function cmd_start(zone_arg)
     state.waypoint_index   = 1
     state.death_latched    = false
     state.elvorseal_fails  = 0
+    state.selected_tp_ring = nil      -- re-scan rings on every start
     reset_arena_tracking()
     state.hud_note         = nil
     state.last_seen_zone   = nil      -- force a settle window on the first tick
