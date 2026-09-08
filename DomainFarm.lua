@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v10.2 (hardened rewrite)
+    DomainFarm v10.3 (hardened rewrite)
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -36,7 +36,7 @@
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '10.2'
+_addon.version  = '10.3'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -54,9 +54,9 @@ local settings = {
     warp_ring       = 'Warp Ring',
     -- Superwarp command strings (adjust if your Superwarp version differs)
     sw_elvorseal    = 'sw ew domain',      -- request Elvorseal at the eschan portal
-    sw_qufim        = 'sw qufim',          -- home point near the Qufim tunnel
-    sw_misareaux    = 'sw misareaux',      -- home point in Misareaux Coast
-    sw_enter_escha  = 'sw escha',          -- enter Escha at the Undulating Confluence
+    sw_qufim        = 'sw hp qufim island',    -- explicit Home Point warp (avoids Survival Guide ambiguity)
+    sw_misareaux    = 'sw hp misareaux coast',  -- explicit Home Point warp (avoids Survival Guide ambiguity)
+    sw_enter_escha  = 'sw ew enter',        -- enter Escha via Eschan portal (per Superwarp docs)
     engage_range    = 7,                   -- melee range check (yalms)
     waypoint_range  = 2,                   -- waypoint arrival tolerance (yalms)
     elvorseal_buff  = 603,                 -- buff ID for Elvorseal
@@ -966,7 +966,7 @@ local function phase_8_superwarp(zone_id)
     if not safe_zone_ids[zone_id] then return end
     state.sw_attempts = state.sw_attempts + 1
     if state.sw_attempts > 6 then
-        stop_bot('Superwarp to the conflux zone is not zoning us (is Superwarp loaded?). Bot stopped.')
+        stop_bot('Superwarp HP warp is not zoning us (is Superwarp loaded / HP unlocked?). Bot stopped.')
         return
     end
     if state.zone_index == 2 then
@@ -981,7 +981,7 @@ local function phase_10_enter_escha(zone_id)
     if not conflux_zone_ids[zone_id] then return end
     state.sw_attempts = state.sw_attempts + 1
     if state.sw_attempts > 6 then
-        stop_bot('Escha entry via Superwarp is not zoning us (is Superwarp loaded / conflux unlocked?). Bot stopped.')
+        stop_bot('Escha entry via Superwarp is not zoning us (is Superwarp loaded / Eschan portal unlocked?). Bot stopped.')
         return
     end
     windower.send_command(settings.sw_enter_escha)
