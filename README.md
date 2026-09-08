@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 10.3
+**Version:** 10.4
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the rare **Mireu** spawn.
@@ -33,12 +33,12 @@ The addon runs an 11-phase self-healing state machine that rotates through the z
 
 1. **Superwarp Addon:** Must be installed and loaded — the bot relies on it for Elvorseal requests and inter-zone travel.
 2. **Teleportation Rings:**
-   - `Dim. Ring (Dem)` — reaches the Dimensional Portal zone (Crag of Dem) for Reisenjima entry.
+   - **Any one** of: `Dim. Ring (Dem)`, `Dim. Ring (Holla)`, or `Dim. Ring (Mea)` — each reaches a different Crag, but all three have a Dimensional Portal to Reisenjima. The bot auto-detects which ring you have and uses it.
    - `Warp Ring` — returns to a safe zone / Home Point after each kill.
 3. **Unlocked Waypoints:**
    - Qufim Island Home Point #1 (route to Escha - Zi'Tah).
    - Misareaux Coast Home Point #1 (route to Escha - Ru'Aun).
-   - The Dimensional Portal at the Crag of Dem.
+   - The Dimensional Portal at whichever Crag your ring reaches (Dem, Holla, or Mea).
 4. **Trusts:** The spells configured in `trust_list` must be learned on your character.
 
 ---
@@ -58,7 +58,8 @@ Open `DomainFarm.lua` in a text editor. All configurable values are at the top i
 ### Rings
 ```lua
 local settings = {
-    teleport_ring   = 'Dim. Ring (Dem)',   -- ring to reach the Dimensional Portal zone
+    -- The bot checks for each ring in order and uses the first one found.
+    teleport_rings  = {'Dim. Ring (Dem)', 'Dim. Ring (Holla)', 'Dim. Ring (Mea)'},
     warp_ring       = 'Warp Ring',         -- ring to return to a safe zone after a kill
 }
 ```
@@ -125,7 +126,7 @@ All commands use `//domainfarm` (or the shorthand `//df`).
 
 | Phase | Name | What Happens |
 | :---: | :--- | :--- |
-| **1** | Teleport Ring | Searches inventory for the Dim. Ring, equips it, and uses it. |
+| **1** | Teleport Ring | Scans inventory for any Dimensional Ring (Dem, Holla, or Mea), picks the first one found, equips it, and uses it. Logs which ring was selected. |
 | **2** | Dimensional Portal | Arrives at the Crag zone. Walks to the Dimensional Portal NPC and injects menu packets to enter Reisenjima. |
 | **3** | Path to Eschan Portal | Walks waypoints from the zone-in point to the Eschan Portal NPC. |
 | **4** | Request Elvorseal | Sends `//sw ew domain` to request the Elvorseal buff. Retries up to 5 times at 60-second intervals. |
@@ -192,7 +193,10 @@ It stubs the Windower 4 environment and runs 23 scenarios covering:
 
 ## 📝 Changelog
 
-### v10.3 (Current)
+### v10.4 (Current)
+- **Multi-ring support** — the bot now searches inventory for any of the three Dimensional Rings (`Dim. Ring (Dem)`, `Dim. Ring (Holla)`, `Dim. Ring (Mea)`) and uses the first one found. No more hardcoding a single ring — works with whichever ring(s) you have. Re-scans each cycle in case charges change.
+
+### v10.3
 - **Superwarp command fix** — Home Point warps now use `sw hp <zone>` (e.g., `sw hp qufim island`) to avoid ambiguity when a Survival Guide and HP are near each other. Escha entry now uses `sw ew enter` per [Superwarp documentation](https://github.com/AkadenTK/superwarp), eliminating lockups at Undulating Confluences and telepoints.
 
 ### v10.2
