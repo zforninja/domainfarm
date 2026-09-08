@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 10.2
+**Version:** 10.3
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the rare **Mireu** spawn.
@@ -15,7 +15,7 @@ The addon runs an 11-phase self-healing state machine that rotates through the z
 - **Full 3-Zone Rotation:** Cycles through Quetzalcoatl (Reisenjima) → Azi Dahaka (Escha - Zi'Tah) → Naga Raja (Escha - Ru'Aun) → repeat.
 - **Mireu Support:** Mireu can spawn in any of the three arenas. The bot detects it automatically, announces it on the HUD, and fights it alongside (or instead of) the zone boss. A 45-second post-kill linger scan ensures Mireu isn't missed if it appears after the primary boss dies.
 - **Self-Healing State Machine:** If you manually warp, zone, die, or your ring is on cooldown, the bot detects the new zone and resumes the correct phase without breaking.
-- **Superwarp Integration:** Uses `//sw` commands for Elvorseal requests (`sw ew domain`), home-point warps (`sw qufim`, `sw misareaux`), and Escha entry (`sw escha`).
+- **Superwarp Integration:** Uses `//sw` commands for Elvorseal requests (`sw ew domain`), explicit Home Point warps (`sw hp qufim island`, `sw hp misareaux coast`) to avoid Survival Guide ambiguity, and Escha entry (`sw ew enter`) per the [Superwarp documentation](https://github.com/AkadenTK/superwarp).
 - **Smart Combat Positioning:** Paths to the flank of each dragon using per-zone waypoints to protect Trusts from frontal breath cleaves.
 - **Coordinate-Based Chase:** Steers toward the mob's actual position using `windower.ffxi.run()` — works regardless of the game's TargetLock setting.
 - **Phantom Spawn Detection:** Filters by `valid_target` and `spawn_type` to ensure only real, engageable dragons are targeted.
@@ -65,10 +65,10 @@ local settings = {
 
 ### Superwarp Commands
 ```lua
-    sw_elvorseal    = 'sw ew domain',      -- request Elvorseal at the Eschan Portal
-    sw_qufim        = 'sw qufim',          -- home point near the Qufim tunnel
-    sw_misareaux    = 'sw misareaux',      -- home point in Misareaux Coast
-    sw_enter_escha  = 'sw escha',          -- enter Escha at the Undulating Confluence
+    sw_elvorseal    = 'sw ew domain',          -- request Elvorseal at the Eschan Portal
+    sw_qufim        = 'sw hp qufim island',    -- explicit HP warp (avoids Survival Guide ambiguity)
+    sw_misareaux    = 'sw hp misareaux coast',  -- explicit HP warp (avoids Survival Guide ambiguity)
+    sw_enter_escha  = 'sw ew enter',            -- enter Escha via Eschan portal (per Superwarp docs)
 ```
 
 ### Trusts
@@ -132,9 +132,9 @@ All commands use `//domainfarm` (or the shorthand `//df`).
 | **5** | Verify Elvorseal | Confirms Buff ID 603 is active. If rejected, falls back to Phase 4 for a retry. |
 | **6** | Arena Combat | Positions on the flank, summons Trusts, scans for the zone boss + Mireu. Engages any valid target using coordinate-based chase. After each kill, lingers 45 seconds scanning for additional targets. Only advances when the arena is clear. HUD shows target name and kill count. |
 | **7** | Warp Ring | Disengages, equips and uses the Warp Ring to return to a safe zone. |
-| **8** | Superwarp Transit | From the safe zone, issues `//sw qufim` or `//sw misareaux` to reach the next zone's staging area. |
-| **9** | Path to Confluence | Walks waypoints through the tunnel to the Undulating Confluence. |
-| **10** | Enter Escha | Issues `//sw escha` to zone into the next Escha area. Returns to Phase 3. |
+| **8** | Superwarp Transit | From the safe zone, issues `//sw hp qufim island` or `//sw hp misareaux coast` to reach the next zone's staging area. Uses explicit `hp` prefix to avoid Survival Guide ambiguity. |
+| **9** | Path to Confluence | Walks waypoints through the tunnel to the Undulating Confluence / Eschan Portal. |
+| **10** | Enter Escha | Issues `//sw ew enter` to zone into the next Escha area. Returns to Phase 3. |
 
 After completing Ru'Aun, the rotation wraps back to Phase 1 (Reisenjima).
 
@@ -192,7 +192,10 @@ It stubs the Windower 4 environment and runs 23 scenarios covering:
 
 ## 📝 Changelog
 
-### v10.2 (Current)
+### v10.3 (Current)
+- **Superwarp command fix** — Home Point warps now use `sw hp <zone>` (e.g., `sw hp qufim island`) to avoid ambiguity when a Survival Guide and HP are near each other. Escha entry now uses `sw ew enter` per [Superwarp documentation](https://github.com/AkadenTK/superwarp), eliminating lockups at Undulating Confluences and telepoints.
+
+### v10.2
 - **Mireu multi-target support** — `bonus_targets` list, sticky targeting, 45-second post-kill linger scan, HUD target/kill display.
 - **Zone confirmation gate** — no entity interaction until the correct zone ID is confirmed.
 - **Post-zone settle delay** (4 seconds) — prevents nil entity lookups right after zoning.
