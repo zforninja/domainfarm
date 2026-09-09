@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v10.4 (hardened rewrite)
+    DomainFarm v10.5 (hardened rewrite)
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -32,11 +32,15 @@
       - post-zone settling window (HUD: "Zone settling...") before entity use
       - phase-specific watchdogs (combat 1200s, transit 300s, menus 120s)
       - coordinate-based chase via get_mob_by_id vectors (TargetLock-independent)
+      - v10.5 resilience: zone-vs-target mismatch resolved by the router (no
+        more "phase 3 in Reisenjima" dead ends), watchdog soft-recovery before
+        stopping, progress-aware watchdog, phase transition log, //df resume,
+        //df start adopts the DI zone you are standing in
 ]]
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '10.4'
+_addon.version  = '10.5'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -72,6 +76,10 @@ local settings = {
     -- Mireu has a small chance to spawn alongside the zone boss; we fight it too.
     bonus_targets   = {'Mireu'},
     post_kill_linger = 45,                 -- seconds to keep scanning for another target after a kill
+    -- Resilience
+    watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt per travel cycle before stopping
+    unknown_zone_grace  = 30,              -- seconds to sit in an unrecognized zone before warping home (0 = never)
+    log_phases          = true,            -- print every phase transition and its reason to the chat log
 }
 
 -- Phase-specific watchdog timeouts (seconds). Combat/arena phases must tolerate
@@ -216,6 +224,7 @@ local state = {
     bonus_seen         = {},           -- bonus target names already announced this visit
     arena_positioned   = false,
     portal             = nil,          -- Dimensional Portal entity snapshot
+    portal_best_dist   = nil,          -- closest approach to the portal (watchdog progress)
     elvorseal_sent_at  = nil,          -- os.time() of last Elvorseal request
     elvorseal_fails    = 0,
     ring_started_at    = nil,          -- os.time() when the current ring phase began
@@ -230,6 +239,9 @@ local state = {
     last_seen_zone     = nil,          -- zone ID observed on the previous tick
     settle_until       = nil,          -- os.time() before which entity interaction is forbidden
     hud_note           = nil,          -- transient status line (settling / zone gate)
+    watchdog_recoveries = 0,           -- soft recoveries used since the last successful travel step
+    unknown_zone_since = nil,          -- os.time() we first saw an unrecognized zone
+    last_transition    = nil,          -- "phase A -> B (reason)" for //df status
 }
 
 -- prerender throttle
@@ -283,6 +295,8 @@ local function stop_bot(reason)
     state.running  = false
     state.phase    = 0
     state.fighting = false
+    state.hud_note = nil      -- never leave "Zone settling..." etc. on a stopped HUD
+    state.settle_until = nil
     windower.ffxi.run(false)
     if reason then
         state.fail_reason = reason
@@ -292,8 +306,14 @@ local function stop_bot(reason)
 end
 
 -- Central phase transition: resets everything a stale phase could poison.
-local function set_phase(p)
+-- `reason` is optional and only used for the transition log / //df status.
+local function set_phase(p, reason)
     if state.phase ~= p then
+        local from = state.phase
+        state.last_transition = ('%s -> %s%s'):format(
+            PHASE_NAMES[from] or tostring(from), PHASE_NAMES[p] or tostring(p),
+            reason and (' (' .. reason .. ')') or '')
+        if settings.log_phases then log('Phase: ' .. state.last_transition) end
         state.phase            = p
         state.phase_started_at = os.time()
         state.waypoint_index   = 1
@@ -310,6 +330,12 @@ local function set_phase(p)
             state.arena_positioned = false
         end
     end
+end
+
+-- Call whenever a phase makes measurable progress (waypoint reached, distance
+-- to an NPC shrinking, ...) so the watchdog only fires on REAL stalls.
+local function mark_progress()
+    state.phase_started_at = os.time()
 end
 
 local function get_zone_id()
@@ -633,7 +659,7 @@ local function executePath(waypoints, target_phase, on_complete)
     if not wp then
         stop_running()
         if on_complete then on_complete() end
-        set_phase(target_phase)
+        set_phase(target_phase, 'path complete')
         delay = 3
         return
     end
@@ -650,6 +676,7 @@ local function executePath(waypoints, target_phase, on_complete)
     else
         state.waypoint_index = state.waypoint_index + 1
         state.last_pos = nil
+        mark_progress()
     end
 end
 
@@ -685,52 +712,133 @@ end
 -- ==========================================================================
 -- ZONE REALITY ROUTER (ID-based)
 -- ==========================================================================
+-- Which DI zone does the current rotation target live in?
+local function target_zone_id()
+    local t = rotation[state.zone_index]
+    return t and t.zone or nil
+end
+
+-- Phase to use when standing INSIDE the target DI zone.
+local function in_target_zone_phase()
+    if isBuffActive(settings.elvorseal_buff) then return 6 end
+    return state.zone_index == 1 and 4 or 3
+end
+
+-- Phase to use when standing in a town / safe zone.
+local function travel_phase_from_town()
+    return state.zone_index == 1 and 1 or 8
+end
+
+-- Conflux zone that leads to the current target (nil for Reisenjima).
+local function expected_conflux_zone()
+    if state.zone_index == 2 then return ZONES.qufim end
+    if state.zone_index == 3 then return ZONES.misareaux end
+    return nil
+end
+
+-- Pick the phase that can make progress from the zone we are physically in.
+-- Used by //df start, //df resume and the watchdog's soft recovery.
+local function reroute_from_reality(zone_id, reason)
+    stop_running()
+    if not zone_id then
+        set_phase(7, reason .. '; zone unknown, warping home')
+    elseif safe_zone_ids[zone_id] then
+        set_phase(travel_phase_from_town(), reason)
+    elseif zone_id == target_zone_id() then
+        state.fighting = false
+        set_phase(in_target_zone_phase(), reason)
+    elseif conflux_zone_ids[zone_id] and zone_id == expected_conflux_zone() then
+        set_phase(9, reason)
+    elseif portal_zone_ids[zone_id] and state.zone_index == 1 then
+        set_phase(2, reason)
+    else
+        set_phase(7, reason .. '; warping home')
+    end
+end
+
+-- Every zone-vs-phase combination the bot can find itself in is resolved
+-- here, every tick. The rule of thumb: if the current phase cannot make
+-- progress in the current zone for the current target, pick one that can.
+-- Phase 7 (Warp Ring home) is the universal escape hatch from any field zone.
 local function enforce_zone_reality(zone_id)
     -- Dead-recovery (phase 11) may only be rerouted once we reach a safe zone;
     -- no other branch is allowed to yank the bot out of it.
     if state.phase == 11 and not safe_zone_ids[zone_id] then return end
 
     if safe_zone_ids[zone_id] then
+        state.unknown_zone_since = nil
         if state.phase == 11 then
             -- Arrived at home point after death: restart travel.
             state.death_latched = false
             state.fighting = false
-            set_phase(state.zone_index == 1 and 1 or 8)
+            set_phase(travel_phase_from_town(), 'back in town after death')
         elseif state.phase > 1 and state.phase < 7 then
-            log('Reality check: in a safe zone with a combat phase active. Resetting transit state.')
             state.fighting = false
-            set_phase(state.zone_index == 1 and 1 or 8)
+            set_phase(travel_phase_from_town(), 'in a safe zone with a field phase active')
         elseif state.phase == 7 then
-            set_phase(8)
+            set_phase(travel_phase_from_town(), 'warp home complete')
+        elseif state.phase == 1 and state.zone_index ~= 1 then
+            set_phase(8, 'target is not Reisenjima; use Superwarp, not the Dim. Ring')
+        elseif state.phase == 8 and state.zone_index == 1 then
+            set_phase(1, 'target is Reisenjima; use the Dim. Ring, not Superwarp')
+        elseif state.phase == 9 or state.phase == 10 then
+            set_phase(travel_phase_from_town(), 'conflux phase while still in town')
         end
+        return
+    end
 
-    elseif conflux_zone_ids[zone_id] then
-        if state.phase ~= 9 and state.phase ~= 10 then
-            set_phase(9)
+    -- Outside town: never interrupt an in-progress warp home.
+    if state.phase == 7 then return end
+
+    if conflux_zone_ids[zone_id] then
+        state.unknown_zone_since = nil
+        if zone_id ~= expected_conflux_zone() then
+            stop_running()
+            set_phase(7, ('in %s but the target is %s; warping home'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
+        elseif state.phase ~= 9 and state.phase ~= 10 then
+            set_phase(9, 'arrived in conflux zone')
         end
 
     elseif portal_zone_ids[zone_id] then
-        if state.phase ~= 2 then set_phase(2) end
-
-    elseif zone_id == ZONES.reisenjima then
-        if state.phase == 1 or state.phase == 2 then
+        state.unknown_zone_since = nil
+        if state.zone_index ~= 1 then
             stop_running()
-            set_phase(4)
+            set_phase(7, ('at a crag but the target is %s; warping home'):format(rotation[state.zone_index].label))
+        elseif state.phase ~= 2 then
+            set_phase(2, 'arrived at crag')
         end
 
-    elseif zone_id == ZONES.zitah or zone_id == ZONES.ruaun then
-        -- Allow 7 (warp ring) to run; anything outside 3..7 gets rerouted.
-        if state.phase < 3 or state.phase > 7 then
-            set_phase(isBuffActive(settings.elvorseal_buff) and 6 or 3)
+    elseif zone_id == ZONES.reisenjima or zone_id == ZONES.zitah or zone_id == ZONES.ruaun then
+        state.unknown_zone_since = nil
+        if zone_id ~= target_zone_id() then
+            -- Standing in a DI zone that is not the current target (e.g. started
+            -- with the wrong argument, or a stale rotation index). Leave.
+            stop_running()
+            set_phase(7, ('in %s but the target is %s; warping home'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
+        else
+            -- Valid arena phases: 4/5/6 for Reisenjima, 3/4/5/6 for Zi'Tah / Ru'Aun.
+            local min_phase = (state.zone_index == 1) and 4 or 3
+            if state.phase < min_phase or state.phase > 6 then
+                stop_running()
+                set_phase(in_target_zone_phase(), 'arrived in target zone')
+            end
         end
 
     else
+        local now = os.time()
         if state.last_unhandled_zone ~= zone_id then
             warning(('Unrecognized zone "%s" at phase %d. Add it to safe_zone_names if it is a valid start/home point.')
                     :format(zone_name_of(zone_id), state.phase))
             state.last_unhandled_zone = zone_id
         end
-        -- Watchdog (below) will pause the bot if we linger here.
+        if not state.unknown_zone_since then state.unknown_zone_since = now end
+        -- After a grace period, use the Warp Ring to get somewhere we understand.
+        if settings.unknown_zone_grace > 0 and state.unknown_zone_since
+           and now - state.unknown_zone_since > settings.unknown_zone_grace then
+            state.unknown_zone_since = nil
+            stop_running()
+            set_phase(7, 'unrecognized zone for ' .. settings.unknown_zone_grace .. 's; warping home')
+        end
     end
 end
 
@@ -756,6 +864,11 @@ local function phase_2_portal()
             stop_bot('Stuck while approaching the Dimensional Portal. Bot stopped.')
             return
         end
+        -- Closing in on the portal counts as progress for the watchdog.
+        if not state.portal_best_dist or dist < state.portal_best_dist - 1 then
+            state.portal_best_dist = dist
+            mark_progress()
+        end
         run_towards(portal.x - me.x, portal.y - me.y)
         delay = 0.1
     else
@@ -773,14 +886,14 @@ end
 local function phase_4_request_elvorseal()
     windower.send_command(settings.sw_elvorseal)
     state.elvorseal_sent_at = os.time()
-    set_phase(5)
+    set_phase(5, 'Elvorseal requested')
     delay = 5
 end
 
 local function phase_5_verify_elvorseal()
     if isBuffActive(settings.elvorseal_buff) then
         state.elvorseal_fails = 0
-        set_phase(6)
+        set_phase(6, 'Elvorseal active')
         return
     end
     if state.elvorseal_sent_at and os.time() - state.elvorseal_sent_at > 10 then
@@ -793,21 +906,22 @@ local function phase_5_verify_elvorseal()
         log(('Elvorseal not detected (attempt %d/%d). Retrying in %ds.')
             :format(state.elvorseal_fails, settings.elvorseal_max, settings.elvorseal_retry))
         delay = settings.elvorseal_retry
-        set_phase(4)
+        set_phase(4, 'Elvorseal not detected; retry')
     end
 end
 
 local function advance_rotation()
+    state.watchdog_recoveries = 0   -- fresh soft-recovery budget for the next leg
     if state.zone_index == 1 then
         state.zone_index = 2
-        set_phase(7)
+        set_phase(7, 'rotation -> Zi\'Tah; warping home first')
     elseif state.zone_index == 2 then
         state.zone_index = 3
-        set_phase(7)
+        set_phase(7, 'rotation -> Ru\'Aun; warping home first')
     else
         state.zone_index = 1
         state.selected_tp_ring = nil   -- re-scan rings next cycle (charges may have changed)
-        set_phase(1)
+        set_phase(1, 'rotation -> Reisenjima')
     end
     reset_arena_tracking()
 end
@@ -817,8 +931,7 @@ local function handle_death(player)
     stop_running()
     if not state.death_latched then
         state.death_latched = true
-        log('Player died. Returning to Home Point...')
-        set_phase(11)
+        set_phase(11, 'player died; returning to Home Point')
         delay = 8
     end
 end
@@ -827,7 +940,7 @@ local function phase_11_dead(player)
     if player.status ~= 2 and player.status ~= 3 then
         -- Raised or already back up: hand control back to the router.
         state.death_latched = false
-        set_phase(state.zone_index == 1 and 1 or 8)
+        set_phase(state.zone_index == 1 and 1 or 8, 'no longer dead')
         return
     end
     -- Reraise dialogue: Param 0 selects "return to Home Point".
@@ -1002,6 +1115,38 @@ local function phase_10_enter_escha(zone_id)
 end
 
 -- ==========================================================================
+-- WATCHDOG SOFT RECOVERY
+-- ==========================================================================
+-- Re-derive the phase from physical reality instead of trusting the stalled
+-- one. Town -> restart travel; target zone -> re-request/re-path; anywhere
+-- else -> Warp Ring home. If that yields the same phase (e.g. a legitimately
+-- long boss wait) we simply reset the path and give it another full window.
+local function watchdog_recover(zone_id)
+    local before = state.phase
+    stop_running()
+    state.waypoint_index   = 1
+    state.last_pos         = nil
+    state.portal           = nil
+    state.portal_best_dist = nil
+    state.sw_attempts      = 0
+    state.elvorseal_sent_at = nil
+
+    if state.phase == 11 then
+        -- Still dead / waiting on the home-point menu: just re-send.
+        state.death_latched = false
+    else
+        reroute_from_reality(zone_id, 'watchdog recovery')
+    end
+
+    if state.phase == before then
+        -- Same phase re-selected: retry it from scratch with a fresh window.
+        state.phase_started_at = os.time()
+        log(('Watchdog: retrying "%s" from scratch.'):format(PHASE_NAMES[state.phase] or state.phase))
+    end
+    delay = 2
+end
+
+-- ==========================================================================
 -- ZONE CONFIRMATION GATE
 -- ==========================================================================
 -- Returns the set of zone IDs in which the given phase is allowed to touch
@@ -1066,11 +1211,20 @@ windower.register_event('prerender', function()
 
     enforce_zone_reality(zone_id)
 
-    -- Phase-specific watchdog.
+    -- Phase-specific watchdog. Soft-recover (re-derive the phase from where we
+    -- actually are) a bounded number of times before giving up.
     local timeout = PHASE_TIMEOUTS[state.phase]
     if timeout and state.phase > 0 and os.time() - state.phase_started_at > timeout then
-        stop_bot(('Watchdog: phase "%s" exceeded %ds without progress. Bot stopped.')
-                 :format(PHASE_NAMES[state.phase] or state.phase, timeout))
+        local pname = PHASE_NAMES[state.phase] or tostring(state.phase)
+        if state.watchdog_recoveries < settings.watchdog_recoveries then
+            state.watchdog_recoveries = state.watchdog_recoveries + 1
+            warning(('Watchdog: phase "%s" exceeded %ds without progress. Soft recovery %d/%d.')
+                    :format(pname, timeout, state.watchdog_recoveries, settings.watchdog_recoveries))
+            watchdog_recover(zone_id)
+            return
+        end
+        stop_bot(('Watchdog: phase "%s" exceeded %ds without progress (%d recoveries failed). Bot stopped. Use //df resume to retry.')
+                 :format(pname, timeout, state.watchdog_recoveries))
         return
     end
 
@@ -1110,7 +1264,8 @@ windower.register_event('prerender', function()
     elseif p == 2  then phase_2_portal()
     elseif p == 3  then
         if     state.zone_index == 2 then executePath(zitah_waypoints, 4)
-        elseif state.zone_index == 3 then executePath(ruaun_waypoints, 4) end
+        elseif state.zone_index == 3 then executePath(ruaun_waypoints, 4)
+        else   set_phase(4, 'Reisenjima has no portal path; go straight to Elvorseal') end
     elseif p == 4  then phase_4_request_elvorseal()
     elseif p == 5  then phase_5_verify_elvorseal()
     elseif p == 6  then phase_6_combat(player)
@@ -1124,7 +1279,8 @@ windower.register_event('prerender', function()
     elseif p == 8  then phase_8_superwarp(zone_id)
     elseif p == 9  then
         if     state.zone_index == 2 then executePath(q_waypoints, 10, function() windower.send_command(settings.sw_enter_escha) end)
-        elseif state.zone_index == 3 then executePath(m_waypoints, 10, function() windower.send_command(settings.sw_enter_escha) end) end
+        elseif state.zone_index == 3 then executePath(m_waypoints, 10, function() windower.send_command(settings.sw_enter_escha) end)
+        else   stop_running(); set_phase(7, 'conflux path has no meaning for Reisenjima; warping home') end
     elseif p == 10 then phase_10_enter_escha(zone_id)
     elseif p == 11 then phase_11_dead(player)
     end
@@ -1138,6 +1294,7 @@ windower.register_event('zone change', function(new_id, old_id)
     delay = 8
     -- Clear anything that must not survive a zone line.
     state.portal          = nil
+    state.portal_best_dist = nil
     reset_arena_tracking()
     state.waypoint_index  = 1
     state.last_pos        = nil
@@ -1215,33 +1372,39 @@ local function cmd_start(zone_arg)
     state.hud_note         = nil
     state.last_seen_zone   = nil      -- force a settle window on the first tick
     state.settle_until     = nil
+    state.watchdog_recoveries = 0
+    state.unknown_zone_since  = nil
+    state.portal_best_dist    = nil
     if hud then hud:show() end
 
     local zone_id = get_zone_id()
 
-    local function resume(zone_idx, escha_zone_id, travel_phase, in_zone_no_buff_phase, boss_label)
+    -- No explicit target and we are already standing in a DI zone: farm THIS
+    -- zone rather than warping out to go to Reisenjima (the most common
+    -- "stuck in phase 3" report came from exactly this situation).
+    if zone_arg == nil and zone_id then
+        if     zone_id == ZONES.zitah then zone_arg = 'zitah'
+        elseif zone_id == ZONES.ruaun then zone_arg = 'ruaun' end
+        if zone_arg then log('No target given; adopting the current zone (' .. zone_arg .. ').') end
+    end
+
+    local function resume(zone_idx, boss_label)
         state.zone_index = zone_idx
-        if zone_id and zone_id == escha_zone_id then
-            if isBuffActive(settings.elvorseal_buff) then
-                set_phase(6)
-                state.fighting = false
-                log('Already at ' .. boss_label .. ' with Elvorseal active. Resuming combat directly.')
-            else
-                set_phase(in_zone_no_buff_phase)
-                log('Already in zone for ' .. boss_label .. ' without Elvorseal. Requesting/pathing now.')
-            end
+        state.phase = 0   -- force set_phase to treat the next phase as a fresh transition
+        if zone_id == target_zone_id() then
+            log('Already in zone for ' .. boss_label .. '. Resuming on the spot.')
         else
-            set_phase(travel_phase)
-            log('Not yet in zone for ' .. boss_label .. '. Router will manage transit...')
+            log('Not yet in zone for ' .. boss_label .. '. Routing from ' .. zone_name_of(zone_id) .. '...')
         end
+        reroute_from_reality(zone_id, 'start')
     end
 
     if zone_arg == 'zitah' then
-        resume(2, ZONES.zitah, 7, 3, "Azi Dahaka (Zi'Tah)")
+        resume(2, "Azi Dahaka (Zi'Tah)")
     elseif zone_arg == 'ruaun' then
-        resume(3, ZONES.ruaun, 7, 3, "Naga Raja (Ru'Aun)")
+        resume(3, "Naga Raja (Ru'Aun)")
     elseif zone_arg == nil or zone_arg == 'reisenjima' or zone_arg == 'reisen' then
-        resume(1, ZONES.reisenjima, 1, 4, 'Quetzalcoatl (Reisenjima)')
+        resume(1, 'Quetzalcoatl (Reisenjima)')
     else
         error('Unknown zone "' .. zone_arg .. '". Valid: reisenjima | zitah | ruaun')
         return
@@ -1254,11 +1417,23 @@ local function cmd_start(zone_arg)
     update_hud()
 end
 
+-- Restart travel for the CURRENT rotation target from wherever we are.
+local function cmd_resume()
+    local idx = state.zone_index
+    local arg = (idx == 2 and 'zitah') or (idx == 3 and 'ruaun') or 'reisenjima'
+    log('Resuming with target ' .. arg .. '...')
+    cmd_start(arg)
+end
+
 local function cmd_status()
     local target = rotation[state.zone_index]
     log('Status : ' .. (state.running and 'RUNNING' or 'PAUSED'))
     log('Target : ' .. (target and target.label or 'None'))
-    log('Phase  : ' .. (PHASE_NAMES[state.phase] or tostring(state.phase)))
+    log('Phase  : ' .. (PHASE_NAMES[state.phase] or tostring(state.phase))
+        .. ('  (%ds in phase)'):format(os.time() - state.phase_started_at))
+    log('Zone   : ' .. zone_name_of(get_zone_id()))
+    if state.last_transition then log('Last transition: ' .. state.last_transition) end
+    log(('Watchdog recoveries used: %d/%d'):format(state.watchdog_recoveries, settings.watchdog_recoveries))
     if state.fail_reason then log('Last failure: ' .. state.fail_reason) end
 end
 
@@ -1266,6 +1441,7 @@ local function cmd_help()
     log('DomainFarm commands:')
     log('  //df start [reisenjima|zitah|ruaun]  - start (default: reisenjima)')
     log('  //df stop                            - stop and reset all state')
+    log('  //df resume                          - restart travel for the current target from here')
     log('  //df status                          - print current state')
     log('  //df mark                            - log current x/y as a waypoint')
     log('  //df help                            - this text')
@@ -1283,6 +1459,9 @@ windower.register_event('addon command', function(...)
 
     elseif cmd == 'start' then
         cmd_start(args[2] and args[2]:lower() or nil)
+
+    elseif cmd == 'resume' then
+        cmd_resume()
 
     elseif cmd == 'status' then
         cmd_status()

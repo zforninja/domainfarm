@@ -4,6 +4,11 @@
 
 local events = {}
 
+-- Windower runs Lua 5.1 (math.atan2 / unpack exist). Newer interpreters used
+-- to run this harness (5.3+/LuaJIT via lupa) may lack them; shim for the harness only.
+math.atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+unpack = unpack or table.unpack
+
 -- Virtual clock so the addon's os.clock/os.time throttles can be advanced.
 local vtime = 1000
 os.clock = function() return vtime end
@@ -271,17 +276,27 @@ assert(world.last_run == nil or world.last_run[1] == false, 'no movement during 
 assert(#world.injected == 0, 'no packets during settle window')
 print('== settling blocks entity interaction OK ==')
 
--- 15. ZONE GATE: phase 6 for zitah while standing in Ru'Aun (289) must do nothing.
-tick(1, 5)                      -- settle expired; router: 289 is escha so phase stays 6/3
+-- 15. WRONG DI ZONE: target is Zi'Tah but we stand in Ru'Aun (289). v10.5: the
+--     router must never touch the boss here; it switches to the Warp Ring (7).
+world.bags = {[0] = {max = 3, [1] = {id = 28540, count = 1}, [2] = {id = 28541, count = 1}}}
+world.sent_commands = {}
+tick(1, 5)                      -- settle expired; router: wrong DI zone -> phase 7
 tick(2, 1)
-assert(#world.injected == 0, 'zone gate must block engage packets in the wrong zone')
-print('== zone gate blocks wrong-zone interaction OK ==')
+assert(#world.injected == 0, 'must not engage anything in the wrong zone')
+local saw_warp_equip = false
+for _, c in ipairs(world.sent_commands) do
+    if c:find('/equip', 1, true) and c:find('Warp Ring', 1, true) then saw_warp_equip = true end
+end
+assert(saw_warp_equip, 'wrong DI zone must trigger the Warp Ring escape (phase 7)')
+print('== wrong DI zone -> warp home OK ==')
 
--- 16. Back in the right zone -> settle -> then coordinate chase runs toward the boss.
+-- 16. Back in the right zone (e.g. the user ran there) -> router puts us in
+--     combat -> settle -> coordinate chase runs toward the boss.
+cmd('stop')
 world.zone = 288
-tick(1, 1)                      -- new settle window armed (zone id changed)
-tick(1, 5)                      -- settled; phase 6; boss visible at (30,30), me at (0,0)
-tick(2, 1)
+cmd('start', 'zitah')
+tick(1, 5); tick(1, 5)          -- first tick arms the settle window, second clears it
+tick(2, 1)                      -- phase 6; boss visible at (30,30), me at (0,0)
 assert(world.last_run and world.last_run[1] ~= false,
        'expected a run() toward the boss coordinates')
 local dx, dy = world.last_run[1], world.last_run[2]
@@ -317,13 +332,22 @@ print('== combat watchdog >300s OK ==')
 
 world.mobs = {}
 world.last_run = nil
-tick(1, 1300)                   -- exceed 1200s with no boss -> watchdog stops the bot
+tick(1, 1300)                   -- exceed 1200s with no boss -> soft recovery #1 (fresh window)
 world.mobs = {[5002] = {id=5002, index=52, name='Azi Dahaka', valid_target=true,
                         spawn_type=16, hpp=100, x=40, y=0, distance=1600}}
 tick(2, 1)
+assert(world.last_run and world.last_run[1] ~= false,
+       'v10.5: first watchdog trip must soft-recover, not stop')
+world.mobs = {}
+tick(1, 1300)                   -- recovery #2
+tick(1, 1300)                   -- budget exhausted -> hard stop
+world.mobs = {[5002] = {id=5002, index=52, name='Azi Dahaka', valid_target=true,
+                        spawn_type=16, hpp=100, x=40, y=0, distance=1600}}
+world.last_run = nil
+tick(2, 1)
 assert(world.last_run == nil or world.last_run[1] == false,
-       'bot must have been stopped by the 1200s combat watchdog')
-print('== combat watchdog 1200s stop OK ==')
+       'bot must stop once the soft-recovery budget is exhausted')
+print('== combat watchdog soft-recovery then stop OK ==')
 
 -- 19. Transit watchdog stays at 300s (phase 9 pathing in Qufim).
 world.zone = 126; world.player.buffs = {}
@@ -338,11 +362,13 @@ world.last_run = nil; world.me = {x = -120, y = 120}
 tick(1, 1)
 assert(world.last_run and world.last_run[1] ~= false, 'transit phase still running before 300s')
 world.me = {x = -130, y = 130}
-tick(1, 60)                     -- now > 300s in phase 9 -> watchdog fires
+tick(1, 60)                     -- now > 300s in phase 9 -> watchdog fires -> soft recovery:
+                                --   Qufim IS the right conflux zone, so re-path from waypoint 1
 world.last_run = nil; world.me = {x = -140, y = 140}
-tick(1, 1)
-assert(world.last_run == nil or world.last_run[1] == false, 'transit watchdog must stop at 300s')
-print('== transit watchdog 300s OK ==')
+tick(2, 1)
+assert(world.last_run and world.last_run[1] ~= false,
+       'transit watchdog must soft-recover (re-path), not stop on the first trip')
+print('== transit watchdog 300s soft-recovery OK ==')
 
 cmd('stop')
 print('== ALL v10.1 TESTS PASSED ==')
@@ -451,6 +477,73 @@ print('== Mireu-only engage OK ==')
 cmd('stop')
 print('== ALL v10.2 MIREU TESTS PASSED ==')
 
+
+-- ==========================================================================
+-- v10.5: RESILIENCE SCENARIOS
+-- ==========================================================================
+
+-- 24. THE SCREENSHOT BUG: target Reisenjima but standing in Zi'Tah with an
+--     explicit 'reisenjima' arg. Old router forced phase 3 (no handler for
+--     zone_index 1) -> guaranteed 300s watchdog. Now: warp home.
+cmd('stop')
+world.zone = 288; world.player.buffs = {}; world.mobs = {}; world.player.status = 0
+world.bags = {[0] = {max = 3, [1] = {id = 28540, count = 1}, [2] = {id = 28541, count = 1}}}
+world.sent_commands = {}
+cmd('start', 'reisenjima')
+tick(1, 5); tick(1, 5); tick(2, 1)
+local warp = false
+for _, c in ipairs(world.sent_commands) do if c:find('Warp Ring', 1, true) then warp = true end end
+assert(warp, 'Reisenjima target while in Zi\'Tah must warp home, not sit in phase 3')
+print('== zone/target mismatch escape OK ==')
+
+-- 25. //df start with NO argument while standing in Zi'Tah adopts Zi'Tah.
+cmd('stop')
+world.zone = 288; world.player.buffs = {603}
+world.mobs = {[5100] = {id=5100, index=61, name='Azi Dahaka', valid_target=true,
+                        spawn_type=16, hpp=100, x=3, y=3, distance=9}}
+world.injected = {}; world.sent_commands = {}; world.me = {x=0, y=0, z=0}
+cmd('start')
+tick(1, 5); tick(1, 5); tick(3, 1)
+assert(count_engages() >= 1, 'no-arg start inside Zi\'Tah must adopt Zi\'Tah and fight')
+for _, c in ipairs(world.sent_commands) do
+    assert(not c:find('Dim. Ring', 1, true), 'must NOT try to use a Dim. Ring from inside Zi\'Tah')
+end
+print('== start adopts current DI zone OK ==')
+
+-- 26. Reisenjima: no Elvorseal -> straight to Elvorseal request (phase 4), never phase 3.
+cmd('stop')
+world.zone = 291; world.player.buffs = {}; world.mobs = {}
+world.sent_commands = {}
+cmd('start', 'reisenjima')
+tick(1, 5); tick(1, 5); tick(2, 1)
+assert(count_cmd('sw ew domain') >= 1, 'Reisenjima without buff must request Elvorseal')
+print('== Reisenjima -> Elvorseal directly OK ==')
+
+-- 27. Stopped HUD must not keep a stale note; //df resume restarts cleanly.
+cmd('stop')
+world.zone = 245; world.bags = {[0] = {max = 2, [1] = {id = 1, count = 1}}}   -- no rings -> stop
+cmd('start', 'reisenjima'); tick(3)
+world.bags = {[0] = {max = 3, [1] = {id = 28540, count = 1}, [2] = {id = 28541, count = 1}}}
+world.sent_commands = {}
+cmd('resume'); tick(2)
+local saw_equip2 = false
+for _, c in ipairs(world.sent_commands) do if c:find('/equip', 1, true) then saw_equip2 = true end end
+assert(saw_equip2, '//df resume must restart travel for the current target')
+print('== resume OK ==')
+
+-- 28. Unrecognized zone: after the grace period the bot warps home instead of idling.
+cmd('stop')
+world.zone = 999; zones[999] = {id=999, en='Mystery Zone', name='Mystery Zone'}
+world.sent_commands = {}
+cmd('start', 'reisenjima')
+tick(1, 5); tick(1, 5); tick(1, 40); tick(2, 1)
+local warp2 = false
+for _, c in ipairs(world.sent_commands) do if c:find('Warp Ring', 1, true) then warp2 = true end end
+assert(warp2, 'unrecognized zone must fall back to the Warp Ring after the grace period')
+print('== unknown zone escape OK ==')
+
+cmd('stop')
+print('== ALL v10.5 RESILIENCE TESTS PASSED ==')
 
 -- 13. stop resets cleanly
 cmd('stop'); cmd('status')

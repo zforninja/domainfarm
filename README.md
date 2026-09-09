@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 10.4
+**Version:** 10.5
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the rare **Mireu** spawn.
@@ -100,6 +100,10 @@ Add or remove names from `bonus_targets` to control which extra spawns the bot w
     elvorseal_max   = 5,                   -- consecutive failures before stopping
     stuck_timeout   = 12,                  -- seconds without movement = stuck
     zone_settle     = 4,                   -- seconds to wait after zoning before touching entities
+    -- Resilience (v10.5)
+    watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt before stopping
+    unknown_zone_grace  = 30,              -- seconds in an unrecognized zone before warping home (0 = never)
+    log_phases          = true,            -- print every phase transition + reason to the chat log
 ```
 
 ---
@@ -113,8 +117,10 @@ All commands use `//domainfarm` (or the shorthand `//df`).
 | `//df start` | Starts at **Reisenjima** (Quetzalcoatl). Uses the Teleport Ring to begin the loop. |
 | `//df start zitah` | Starts at **Escha - Zi'Tah** (Azi Dahaka). Warps to Qufim to enter. |
 | `//df start ruaun` | Starts at **Escha - Ru'Aun** (Naga Raja). Warps to Misareaux to enter. |
+| `//df start` (inside Zi'Tah / Ru'Aun) | v10.5: with no argument, the bot **adopts the DI zone you are standing in** instead of warping out to Reisenjima. |
 | `//df stop` | Halts the bot, clears the active phase, and stops all movement. |
-| `//df status` | Prints the current state: running/paused, target zone, phase, and any error. |
+| `//df resume` | v10.5: restarts travel for the **current** target from wherever you are (use after a watchdog stop). |
+| `//df status` | Prints the current state: running/paused, target zone, phase (+ seconds in phase), current zone, last phase transition, watchdog recoveries used, and any error. |
 | `//df mark` | Prints your current X/Y coordinates to the chat log (for building waypoint paths). |
 | `//df help` | Prints the command list. |
 
@@ -149,9 +155,10 @@ After completing Ru'Aun, the rotation wraps back to Phase 1 (Reisenjima).
 
 - **Zone confirmation gate** — the bot will not touch NPCs or mobs unless the current zone ID matches what the phase expects.
 - **Post-zone settle** — after any zone change, a 4-second cooldown prevents entity interaction while the client loads.
-- **Phase watchdog** — each phase has a timeout (2 / 5 / 20 min depending on the phase type). If exceeded, the bot stops and reports the cause.
+- **Phase watchdog** — each phase has a timeout (2 / 5 / 20 min depending on the phase type). The timer is refreshed by *real progress* (a waypoint reached, closing distance on the portal), not just by phase changes. When it trips, the bot first performs a **soft recovery**: it re-derives the phase from where you physically are (town → restart travel; target zone → re-request Elvorseal / re-path; anywhere else → Warp Ring home). Only after `watchdog_recoveries` failed recoveries does it stop, and `//df resume` picks it back up.
 - **Stuck detection** — checks position progress every 12 seconds during movement; flags geometry snags.
-- **Zone reality enforcement** — if the player ends up in a zone that doesn't match the current phase (manual warp, disconnect, etc.), the state machine resets to the correct phase for the actual zone.
+- **Zone reality enforcement** — every tick, the router checks the current zone *against the current target*, not just against the phase. Standing in a DI zone, crag or conflux that doesn't belong to the current target → Warp Ring home and restart travel. Reisenjima never enters the "Pathing to Eschan Portal" phase (it has no portal path). Phase 1 vs 8 (Dim. Ring vs Superwarp) is corrected in town if the rotation index says otherwise. Unrecognized zones warp home after `unknown_zone_grace` seconds instead of idling into the watchdog.
+- **Phase transition log** — every transition prints `Phase: A -> B (reason)` so a stall can be diagnosed from the chat log; the last transition is also shown by `//df status`.
 
 ---
 
@@ -163,7 +170,7 @@ An offline test harness is included:
 lua5.1 test_harness.lua
 ```
 
-It stubs the Windower 4 environment and runs 23 scenarios covering:
+It stubs the Windower 4 environment and runs 28 scenarios covering:
 - Addon load, all commands, nil-guard checks
 - Ring equip/use with missing inventory
 - Menu packet handling (injected, blocked, valid)
@@ -172,7 +179,11 @@ It stubs the Windower 4 environment and runs 23 scenarios covering:
 - Cutscene status ≠ death (no false triggers)
 - Zone settling and zone-gate enforcement
 - Coordinate-based chase vector validation
-- Phase watchdogs (combat survives 400s, stops at 1200s; transit stops at 300s)
+- Phase watchdogs (combat survives 400s; soft-recovers at 1200s, stops after the recovery budget; transit re-paths at 300s)
+- Zone/target mismatch (target Reisenjima while standing in Zi'Tah) → Warp Ring escape, never a dead phase
+- `//df start` with no argument inside a DI zone adopts that zone
+- Reisenjima goes straight to the Elvorseal request (never the portal-pathing phase)
+- `//df resume` after a stop; unrecognized zone → warp home after the grace period
 - Mireu appearing after a primary kill → engaged
 - Post-kill linger expiry → rotation advance
 - Sticky targeting when both boss and Mireu are alive
@@ -193,7 +204,15 @@ It stubs the Windower 4 environment and runs 23 scenarios covering:
 
 ## 📝 Changelog
 
-### v10.4 (Current)
+### v10.5 (Current)
+- **Fixed the "phase 3 in Reisenjima" dead end** — with the target set to Reisenjima but the character standing in Zi'Tah/Ru'Aun (e.g. `//df start` after finishing a previous session there), the old router forced *Pathing to Eschan Portal*, a phase that has no handler for Reisenjima. The bot then idled until the 300 s watchdog stopped it. The router now checks zone **against the target** and warps home when they disagree; the phase-3 handler also self-corrects to the Elvorseal request for Reisenjima.
+- **Watchdog soft recovery** — a tripped watchdog re-derives the phase from physical reality (up to `watchdog_recoveries` times) before stopping. Progress inside a phase (waypoint reached, closing on the portal) refreshes the timer.
+- **Zone-aware `//df start` / new `//df resume`** — no-arg start adopts the DI zone you are in; `resume` restarts travel for the current target from anywhere. Start/resume/recovery all use one routing function, so there is a single source of truth for "which phase can make progress from here".
+- **Diagnostics** — `Phase: A -> B (reason)` log lines (toggle `log_phases`), richer `//df status`, stale HUD notes ("Zone settling...") cleared on stop.
+- **Unrecognized zone fallback** — warps home after `unknown_zone_grace` seconds instead of waiting for the watchdog.
+- Harness: 28 scenarios (5 new); runs under Lua 5.1 or newer interpreters (`math.atan2` shim is harness-only).
+
+### v10.4
 - **Multi-ring support** — the bot now searches inventory for any of the three Dimensional Rings (`Dim. Ring (Dem)`, `Dim. Ring (Holla)`, `Dim. Ring (Mea)`) and uses the first one found. No more hardcoding a single ring — works with whichever ring(s) you have. Re-scans each cycle in case charges change.
 
 ### v10.3
