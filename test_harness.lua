@@ -9,6 +9,26 @@ local events = {}
 math.atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 unpack = unpack or table.unpack
 
+-- Windower's `pack` library extends strings with a bit-field unpack:
+-- str:unpack('bN', bytepos[, bitpos]) reads N bits starting at byte `bytepos`
+-- (1-based), bit `bitpos` (1-based, LSB first). libs/df_eschawarp.lua uses
+-- 'b2' / 'b8' to read the Domain menu status bits. Stock Lua either lacks
+-- string.unpack (5.1) or has an incompatible one (5.3+), so shim the subset
+-- the addon needs -- harness only; Windower provides the real thing.
+string.unpack = function(s, fmt, bytepos, bitpos)
+    local nbits = tonumber(fmt:match('^b(%d+)$'))
+    assert(nbits, 'harness string.unpack shim only supports bN formats, got ' .. tostring(fmt))
+    local bit0 = ((bytepos or 1) - 1) * 8 + ((bitpos or 1) - 1)
+    local value = 0
+    for i = 0, nbits - 1 do
+        local abs  = bit0 + i
+        local byte = s:byte(math.floor(abs / 8) + 1) or 0
+        local bit  = math.floor(byte / 2 ^ (abs % 8)) % 2
+        value = value + bit * 2 ^ i
+    end
+    return value
+end
+
 -- Virtual clock so the addon's os.clock/os.time throttles can be advanced.
 local vtime = 1000
 os.clock = function() return vtime end
@@ -389,8 +409,8 @@ local function count_cmd(pattern)
     return n
 end
 
--- 20. Primary boss dies, Mireu appears inside the linger window -> bot must engage Mireu,
---     NOT warp home (no 'Warp Ring' equip / phase 7).
+-- 20. (v11.4) Primary boss dies -> NO linger: disengage, then advance the
+--     rotation immediately (Warp Ring phase 7 for Zi'Tah -> Ru'Aun).
 cmd('stop')
 world.bags = {[0] = {max = 2, [1] = {id = 28540, count = 1}, [2] = {id = 28541, count = 1}}}
 world.zone = 288; world.player.buffs = {603}; world.player.status = 0
@@ -411,32 +431,32 @@ tick(1, 1)                                          -- missing_since set
 tick(1, 7); tick(1, 7)                              -- >6s grace -> kill counted, /attack off
 assert(count_cmd('/attack off') >= 1, 'expected disengage after kill')
 world.player.status = 0
-tick(1, 3)                                          -- inside 45s linger, nothing up
--- Mireu spawns 20s after the kill
-world.mobs[6100] = {id=6100, index=61, name='Mireu', valid_target=true,
-                    spawn_type=16, hpp=100, x=-10, y=35, distance=2}
-local engages_before = count_engages()
-tick(3, 10)
-assert(count_engages() > engages_before, 'bot must engage Mireu that spawned inside the linger window')
-assert(count_cmd('Warp Ring') == 0, 'bot must NOT warp home while Mireu is alive')
-print('== Mireu spawn after primary kill -> engaged OK ==')
+tick(2, 4)                                          -- disengaged -> advance_rotation -> phase 7
+assert(count_cmd('Warp Ring') >= 1, 'v11.4: kill must advance the rotation immediately (no 45s linger)')
+print('== kill -> immediate advance (no linger) OK ==')
 
--- 21. Mireu dies, nothing else spawns -> after linger expires bot advances (Warp Ring phase 7).
+-- 21. (v11.4) Mireu spawned IN PLACE of the dragon: engaged and, once it dies,
+--     the rotation advances the same way.
+cmd('stop')
+world.zone = 288; world.player.buffs = {603}; world.player.status = 0
+world.me = {x=-9.19, y=33.85}
+world.mobs = {[6100] = {id=6100, index=61, name='Mireu', valid_target=true,
+                        spawn_type=16, hpp=100, x=-10, y=35, distance=2}}
+world.injected = {}; world.sent_commands = {}
+cmd('start', 'zitah')
+tick(1, 5); tick(1, 5); tick(3, 1)
+assert(count_engages() >= 1, 'Mireu in place of the dragon must be engaged')
 world.player.status = 1
 tick(1, 1)
 world.mobs[6100].hpp = 0
-tick(1, 1)
-tick(1, 7); tick(1, 7)                              -- kill #2 counted
+tick(1, 1); tick(1, 7); tick(1, 7)
 world.player.status = 0
-world.sent_commands = {}
-tick(1, 10)                                         -- 10s into linger: still waiting
-assert(count_cmd('Warp Ring') == 0, 'must not advance before linger expires')
-tick(2, 25)                                         -- ~60s > 45s linger -> arena clear -> phase 7
-tick(1, 1)
-assert(count_cmd('Warp Ring') >= 1, 'expected Warp Ring equip after arena clear (phase 7)')
-print('== linger expiry -> advance rotation OK ==')
+tick(2, 4)
+assert(count_cmd('Warp Ring') >= 1, 'Mireu kill must advance the rotation')
+print('== Mireu kill -> advance OK ==')
 
--- 22. Mireu is present at the same time as the boss -> sticky target (no ping-pong).
+-- 22. Sticky target: whichever DI mob was acquired first stays the target
+--     even if another candidate wanders closer (no ping-pong).
 cmd('stop')
 world.zone = 288; world.player.buffs = {603}; world.player.status = 0
 world.me = {x=-9.19, y=33.85}
@@ -452,7 +472,6 @@ for _, p in ipairs(world.injected) do
     if p.id == 0x01A and p.fields['Category'] == 2 then first_target = p.fields['Target']; break end
 end
 assert(first_target == 7000, 'closest target (boss) must be acquired first, got ' .. tostring(first_target))
--- Mireu moves closer; target must remain the boss (sticky)
 world.mobs[7100].x, world.mobs[7100].y = -9, 34
 world.player.status = 1
 world.injected = {}
@@ -484,17 +503,22 @@ print('== ALL v10.2 MIREU TESTS PASSED ==')
 
 -- 24. THE SCREENSHOT BUG: target Reisenjima but standing in Zi'Tah with an
 --     explicit 'reisenjima' arg. Old router forced phase 3 (no handler for
---     zone_index 1) -> guaranteed 300s watchdog. Now: warp home.
+--     zone_index 1) -> guaranteed 300s watchdog. v11: escape_phase() picks the
+--     Dim. Ring (phase 1) because the target is Reisenjima and the ring works
+--     from anywhere; it must never sit in phase 3 or engage.
 cmd('stop')
 world.zone = 288; world.player.buffs = {}; world.mobs = {}; world.player.status = 0
 world.bags = {[0] = {max = 3, [1] = {id = 28540, count = 1}, [2] = {id = 28541, count = 1}}}
-world.sent_commands = {}
+world.sent_commands = {}; world.injected = {}
 cmd('start', 'reisenjima')
 tick(1, 5); tick(1, 5); tick(2, 1)
-local warp = false
-for _, c in ipairs(world.sent_commands) do if c:find('Warp Ring', 1, true) then warp = true end end
-assert(warp, 'Reisenjima target while in Zi\'Tah must warp home, not sit in phase 3')
-print('== zone/target mismatch escape OK ==')
+local dim = false
+for _, c in ipairs(world.sent_commands) do
+    if c:find('/equip', 1, true) and c:find('Dim. Ring', 1, true) then dim = true end
+end
+assert(dim, 'Reisenjima target while in Zi\'Tah must escape via the Dim. Ring, not sit in phase 3')
+assert(#world.injected == 0, 'must not engage anything while escaping the wrong zone')
+print('== zone/target mismatch escape (Dim. Ring) OK ==')
 
 -- 25. //df start with NO argument while standing in Zi'Tah adopts Zi'Tah.
 cmd('stop')
@@ -510,14 +534,32 @@ for _, c in ipairs(world.sent_commands) do
 end
 print('== start adopts current DI zone OK ==')
 
--- 26. Reisenjima: no Elvorseal -> straight to Elvorseal request (phase 4), never phase 3.
+-- 26. (v11) Reisenjima without Elvorseal: no Superwarp command is ever sent;
+--     the bot approaches the Domain NPC (Shiftrix) itself and interacts (0x01A
+--     Category 0) once in range, then the captured menu drives phase 4.
 cmd('stop')
-world.zone = 291; world.player.buffs = {}; world.mobs = {}
-world.sent_commands = {}
+world.zone = 291; world.player.buffs = {}
+world.me = {x=0, y=0, z=0}
+world.mobs = {[9000] = {id=9000, index=90, name='Shiftrix', valid_target=true, x=1, y=1, distance=2}}
+world.sent_commands = {}; world.injected = {}
 cmd('start', 'reisenjima')
 tick(1, 5); tick(1, 5); tick(2, 1)
-assert(count_cmd('sw ew domain') >= 1, 'Reisenjima without buff must request Elvorseal')
-print('== Reisenjima -> Elvorseal directly OK ==')
+assert(count_cmd('sw ew') == 0, 'v11: Elvorseal must not go through Superwarp')
+local interacted = false
+for _, p in ipairs(world.injected) do
+    if p.id == 0x01A and p.fields['Category'] == 0 and p.fields['Target'] == 9000 then interacted = true end
+end
+assert(interacted, 'must interact with the Domain NPC natively')
+-- Feed the menu-open chunk: dragon up (b2 bits != 0/3), no Elvorseal -> sequence starts with Option 14.
+local params = string.char(1, 0, 0, 0, 0, 0, 0, 0)
+events['incoming chunk'](0x034, {NPC=9000, ['Menu ID']=9001, Zone=291, ['Menu Parameters']=params}, nil, false, false)
+tick(2, 6)                      -- past the 5s post-interaction delay gate
+local opt14 = false
+for _, p in ipairs(world.injected) do
+    if p.id == 0x05B and p.fields['Option Index'] == 14 then opt14 = true end
+end
+assert(opt14, 'domain menu capture must start the native Elvorseal/warp sequence')
+print('== Reisenjima native Domain NPC interaction OK ==')
 
 -- 27. Stopped HUD must not keep a stale note; //df resume restarts cleanly.
 cmd('stop')
@@ -531,19 +573,22 @@ for _, c in ipairs(world.sent_commands) do if c:find('/equip', 1, true) then saw
 assert(saw_equip2, '//df resume must restart travel for the current target')
 print('== resume OK ==')
 
--- 28. Unrecognized zone: after the grace period the bot warps home instead of idling.
+-- 28. Unrecognized zone: after the grace period the bot escapes instead of
+--     idling. v11: target is Reisenjima -> escape_phase() = Dim. Ring (phase 1).
 cmd('stop')
 world.zone = 999; zones[999] = {id=999, en='Mystery Zone', name='Mystery Zone'}
 world.sent_commands = {}
 cmd('start', 'reisenjima')
 tick(1, 5); tick(1, 5); tick(1, 40); tick(2, 1)
-local warp2 = false
-for _, c in ipairs(world.sent_commands) do if c:find('Warp Ring', 1, true) then warp2 = true end end
-assert(warp2, 'unrecognized zone must fall back to the Warp Ring after the grace period')
+local esc = false
+for _, c in ipairs(world.sent_commands) do
+    if c:find('/equip', 1, true) and (c:find('Dim. Ring', 1, true) or c:find('Warp Ring', 1, true)) then esc = true end
+end
+assert(esc, 'unrecognized zone must fall back to a ring escape after the grace period')
 print('== unknown zone escape OK ==')
 
 cmd('stop')
-print('== ALL v10.5 RESILIENCE TESTS PASSED ==')
+print('== ALL v11.4 RESILIENCE TESTS PASSED ==')
 
 -- 13. stop resets cleanly
 cmd('stop'); cmd('status')

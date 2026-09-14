@@ -1,51 +1,129 @@
 --[[
-    DomainFarm v10.5 (hardened rewrite)
+    DomainFarm v11.4
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
               -> Escha-Ru'Aun (Naga Raja) -> repeat.
 
-    Bonus targets: Mireu can spawn in any of the three arenas; it is added to
-    every zone's target list and fought when present (see settings.bonus_targets).
+    Alternate spawn: Mireu can appear in place of a zone's dragon (not
+    alongside or after it -- exactly one of the two is ever up per visit),
+    so it's added to every zone's target list and fought the same way the
+    dragon would be (see settings.bonus_targets).
 
-    Hard external dependency: the Superwarp addon must be loaded
-    (used for Elvorseal requests, home-point warps and conflux entry).
+    Dependencies:
+      - Windower 4's stock 'packets' / 'resources' / 'texts' libraries.
+      - libs/df_zones.lua, libs/df_waypoints.lua, libs/df_trusts.lua,
+        libs/df_eschawarp.lua (ship these alongside this file, under the
+        addon's own libs/ folder).
+      - The Superwarp addon must be loaded, but ONLY for Home Point warps
+        (phase 8, used when the target is Escha-Zi'Tah/Ru'Aun and we're
+        starting from a town). Everything else -- the Dimensional Portal to
+        Reisenjima, requesting Elvorseal, entering Escha from the conflux --
+        is done natively with our own packets. See "v11: dropped the
+        Superwarp dependency for..." below for why Home Point warping alone
+        was deliberately NOT brought in-house.
 
-    This rewrite fixes every issue documented in domainfarm_analysis.md:
+    v11.4: Mireu doesn't spawn after a zone's dragon is killed -- it spawns
+    in place of it (exactly one of the two is ever up per visit). The old
+    post-kill logic didn't know that: it waited settings.post_kill_linger
+    (45s) after every kill scanning for a second target that was never
+    coming. Removed that wait entirely -- confirming a kill now disengages
+    (if needed) and calls advance_rotation() immediately. Targeting itself
+    was already correct (Mireu was already in every zone's target set and
+    would be found and engaged whether it or the dragon spawned); only the
+    post-kill wait was wrong.
+
+    v11.3: the initial engage packet used to fire in the same tick as the
+    turn-to-face command. windower.ffxi.turn() needs at least a moment to
+    actually rotate the character, so engaging immediately after could catch
+    the client still mid-turn (reported: not always facing the mob when
+    engaging). engage_when_facing_ready() now turns, waits one tick, then
+    engages. The "stuck, engage from here" fallback had a second version of
+    the same gap -- it never called face_towards() at all before engaging --
+    now fixed the same way.
+
+    v11.2: build_domain_sequence()'s steps (libs/df_eschawarp.lua) now carry
+    a wait_ack flag matching map/escha.lua's wait_packet=0x05C exactly --
+    every step except Option Index 14 needs the real acknowledgement, not a
+    guessed delay. run_action_queue() (replacing the old fixed-delay
+    run_packet_sequence()) waits for the actual incoming 0x05C before firing
+    the next menu selection, falling back to a 5s timeout if one never
+    arrives. This was the reported bug: interacting with Affi in Escha-
+    Zi'Tah never warped to the arena, because a later selection was firing
+    before the server had processed the previous one. build_enter_sequence()
+    (phase 10) is unchanged -- the source shows no such dependency there.
+
+    v11.1: restored the terrain-following waypoint paths to the Domain
+    Invasion NPC (zitah_waypoints/ruaun_waypoints) and the Undulating
+    Confluence (q_waypoints/m_waypoints) that v11.0 had dropped in favor of
+    a pure straight-line walk to the live entity. That was wrong: those
+    paths exist to route around real terrain (a wall, a ledge) between the
+    zone entrance and the NPC, and a straight vector can't do that -- it
+    just walks into whatever's in the way and sits there. Phases 3 and 9 now
+    walk the fixed path first, THEN do the dynamic find-and-interact for the
+    last stretch (see approach_via_waypoints_then_interact()) -- keeping
+    both fixes rather than trading one for the other.
+
+    v11: dropped the Superwarp dependency for Elvorseal requests and Escha
+    entry (previously "sw ew domain" / "sw ew enter"), replacing them with
+    native packet sequences ported from Superwarp's own map/escha.lua
+    (Akaden, BSD-3-Clause; see libs/df_eschawarp.lua for the specific lines
+    each function is based on, and the license notice preserved there).
+    This was reading Superwarp's own do_sub_cmd(): it requires the player be
+    within 6 yalms of the target NPC and does NOT walk there itself -- so
+    DomainFarm's old fixed waypoints only ever solved "am I close enough",
+    never "how do I get there" -- both still matter, see v11.1 above.
+    Home Point warping (phase 8) was deliberately left on Superwarp: it's
+    Superwarp's largest subsystem (fuzzy name matching against every home
+    point in the game, character-specific unlock-bit checks), rebuilding it
+    natively is a much worse cost/benefit trade than the Escha portal work
+    was, and Superwarp already gets that logic right and keeps it patched.
+
+    v11 also splits static data and the new Escha packet logic out into
+    libs/ so this file only holds DomainFarm's own state machine:
+      libs/df_zones.lua      - zone ID resolution, safe/portal/conflux
+                                zone sets, the rotation table
+      libs/df_waypoints.lua  - all waypoint paths: terrain-following walks
+                                to the Domain NPC / Undulating Confluence,
+                                and the post-teleport arena landing walks
+      libs/df_trusts.lua     - trust lineup + missing-trust lookup
+      libs/df_eschawarp.lua  - native Elvorseal/Escha-entry packet builders
+
+    Everything documented in prior passes remains fixed:
       - all nil-dereference crash sites guarded (player/me/party/res lookups)
-      - no dependency on the unloaded 'maths' library (no (n):radian())
       - menu automation reads Menu ID / Zone from the parsed packet instead
-        of hardcoding 222/926, ignores injected chunks, blocks the client
-        menu, and staggers the release packet
+        of hardcoding it, ignores injected chunks, blocks the client menu
       - death detected only on status 2/3 (never cutscenes), one-shot latch
       - disengage before ring/warp phases
-      - per-phase watchdog timeouts: the bot can no longer spin forever on
-        a missing ring, uncharged enchant, failed Elvorseal, missing portal,
-        unrecognized zone, geometry snag or a silently-failing Superwarp
-      - waypoint index reset on every phase change (centralized set_phase)
-      - stuck-movement detection on all pathing
-      - zone routing by zone ID (resolved from resources at load), not by
-        name-string comparison at runtime
+      - per-phase watchdog timeouts, with soft-recovery (2 attempts,
+        refreshed on every actual zone change, not just once per rotation
+        leg) before a hard stop
+      - progress-aware watchdog (mark_progress()) for approach/pathing phases
+      - zone-vs-target mismatch resolved by a single "reality router"
+        (enforce_zone_reality) that runs every tick before phase dispatch
+      - zone routing by zone ID, not by name-string comparison at runtime
       - party fullness via party1_count, not the p5 proxy
       - explicit stop/pause on logout; movement halted on unload
-      - zone confirmation gate: NPC/mob phases only run in their expected zone
-      - post-zone settling window (HUD: "Zone settling...") before entity use
-      - phase-specific watchdogs (combat 1200s, transit 300s, menus 120s)
-      - coordinate-based chase via get_mob_by_id vectors (TargetLock-independent)
-      - v10.5 resilience: zone-vs-target mismatch resolved by the router (no
-        more "phase 3 in Reisenjima" dead ends), watchdog soft-recovery before
-        stopping, progress-aware watchdog, phase transition log, //df resume,
-        //df start adopts the DI zone you are standing in
+      - zone confirmation gate, post-zone settling window, phase-transition
+        log, //df resume, //df start adopts the DI zone you're standing in
+      - Superwarp's own chat output (phase 8) is read via 'incoming text' so
+        DomainFarm reacts to what Superwarp actually reports instead of only
+        a fixed timer
 ]]
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '10.5'
+_addon.version  = '11.4'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
 local packets = require('packets')
 local res     = require('resources')
+
+local zones     = require('libs/df_zones')
+local waypoints = require('libs/df_waypoints')
+local trusts    = require('libs/df_trusts')
+local eschawarp = require('libs/df_eschawarp')
 
 -- Optional HUD
 local texts_success, texts = pcall(require, 'texts')
@@ -58,13 +136,13 @@ local settings = {
     -- The bot checks inventory for each ring in order and uses the first one found.
     teleport_rings  = {'Dim. Ring (Dem)', 'Dim. Ring (Holla)', 'Dim. Ring (Mea)'},
     warp_ring       = 'Warp Ring',
-    -- Superwarp command strings (adjust if your Superwarp version differs)
-    sw_elvorseal    = 'sw ew domain',      -- request Elvorseal at the eschan portal
-    sw_qufim        = 'sw hp qufim island',    -- explicit Home Point warp (avoids Survival Guide ambiguity)
+    -- Superwarp command strings for the ONE thing still routed through it:
+    -- Home Point warps to the conflux zones (adjust if your version differs).
+    sw_qufim        = 'sw hp qufim island',     -- explicit Home Point warp (avoids Survival Guide ambiguity)
     sw_misareaux    = 'sw hp misareaux coast',  -- explicit Home Point warp (avoids Survival Guide ambiguity)
-    sw_enter_escha  = 'sw ew enter',        -- enter Escha via Eschan portal (per Superwarp docs)
     engage_range    = 7,                   -- melee range check (yalms)
     waypoint_range  = 2,                   -- waypoint arrival tolerance (yalms)
+    npc_range       = 3,                   -- interaction range for Dimensional Portal / Domain NPC / Confluence
     elvorseal_buff  = 603,                 -- buff ID for Elvorseal
     elvorseal_retry = 60,                  -- seconds between Elvorseal retries
     elvorseal_max   = 5,                   -- consecutive failures before giving up
@@ -72,101 +150,57 @@ local settings = {
     stuck_timeout   = 12,                  -- seconds without movement progress = stuck
     zone_settle     = 4,                   -- seconds to wait after arriving in a zone before touching entities
     movement_mode   = 'vector',            -- 'vector' = windower.ffxi.run(dx, dy); 'heading' = run(radians)
-    -- Bonus Domain Invasion targets that can appear in ANY of the three zones.
-    -- Mireu has a small chance to spawn alongside the zone boss; we fight it too.
+    -- Alternate Domain Invasion spawns: Mireu can appear in place of the
+    -- zone's dragon (not alongside or after it -- exactly one of the two is
+    -- ever up in a given visit), so it's added to every zone's target set
+    -- and fought the same way the dragon would be.
     bonus_targets   = {'Mireu'},
-    post_kill_linger = 45,                 -- seconds to keep scanning for another target after a kill
     -- Resilience
-    watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt per travel cycle before stopping
+    watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt before stopping (refreshed per zone change)
     unknown_zone_grace  = 30,              -- seconds to sit in an unrecognized zone before warping home (0 = never)
     log_phases          = true,            -- print every phase transition and its reason to the chat log
 }
 
 -- Phase-specific watchdog timeouts (seconds). Combat/arena phases must tolerate
--- the 15+ minute wait for a Domain Invasion boss to spawn; transit phases are
--- stuck if they take 5 minutes; teleport/menu phases are stuck after 2 minutes.
+-- the 15+ minute wait for a Domain Invasion boss to spawn; approach/transit
+-- phases are stuck much sooner.
 local PHASE_TIMEOUTS = {
     [1]  = 120,    -- teleport ring
     [2]  = 120,    -- dimensional portal menu
-    [3]  = 300,    -- pathing to eschan portal
-    [4]  = 1200,   -- requesting elvorseal (arena)
-    [5]  = 1200,   -- verifying elvorseal (arena)
+    [3]  = 180,    -- approaching the Domain Invasion NPC
+    [4]  = 60,     -- processing its menu (Elvorseal + warp-to-arena sequence)
+    [5]  = 1200,   -- verifying elvorseal (arena, dragon may not be up yet)
     [6]  = 1200,   -- combat / waiting for boss spawn
     [7]  = 120,    -- warp ring
-    [8]  = 120,    -- superwarp from safe zone
-    [9]  = 300,    -- pathing to undulating confluence
-    [10] = 120,    -- superwarp escha entry
+    [8]  = 120,    -- superwarp home point warp
+    [9]  = 180,    -- approaching the Undulating Confluence
+    [10] = 60,     -- processing its menu (enter Escha)
     [11] = 300,    -- dead / home point
 }
 
--- Trust lineup: primary spell with optional alternate.
-local trust_list = {
-    {spell = 'Ulmia',       alt = 'Arciela II'},
-    {spell = 'Qultada',     alt = nil},
-    {spell = 'Koru-Moru',   alt = nil},
-    {spell = 'Joachim',     alt = 'Lilisette'},
-    {spell = 'Sylvie (UC)', alt = 'Prishe II'},
-}
-
 -- ==========================================================================
--- ZONE RESOLUTION (name -> ID at load; runtime routing is ID-based)
+-- ZONE / ROTATION DATA (libs/df_zones.lua) + ARENA WAYPOINTS (libs/df_waypoints.lua)
 -- ==========================================================================
-local function zone_id_of(name)
-    local z = res.zones:with('en', name)
-    if not z then
-        warning(('Zone "%s" not found in resources; routing for it is disabled.'):format(name))
-        return nil
-    end
-    return z.id
-end
+local ZONES            = zones.ZONES
+local safe_zone_ids    = zones.safe_zone_ids
+local portal_zone_ids  = zones.portal_zone_ids
+local conflux_zone_ids = zones.conflux_zone_ids
+local rotation         = zones.rotation
+local zone_name_of     = zones.zone_name_of
 
-local ZONES = {
-    reisenjima = zone_id_of('Reisenjima'),
-    zitah      = zone_id_of('Escha - Zi\'Tah'),
-    ruaun      = zone_id_of('Escha - Ru\'Aun'),
-    la_theine  = zone_id_of('La Theine Plateau'),
-    konschtat  = zone_id_of('Konschtat Highlands'),
-    tahrongi   = zone_id_of('Tahrongi Canyon'),
-    qufim      = zone_id_of('Qufim Island'),
-    misareaux  = zone_id_of('Misareaux Coast'),
-}
+local zitah_arena_wps = waypoints.zitah_arena_wps
+local ruaun_arena_wps = waypoints.ruaun_arena_wps
+local reisen_arena    = waypoints.reisen_arena
+local zitah_waypoints = waypoints.zitah_waypoints   -- zone entrance -> Domain NPC (terrain)
+local ruaun_waypoints = waypoints.ruaun_waypoints   -- zone entrance -> Domain NPC (terrain)
+local q_waypoints     = waypoints.q_waypoints       -- zone entrance -> Undulating Confluence (terrain)
+local m_waypoints     = waypoints.m_waypoints       -- zone entrance -> Undulating Confluence (terrain)
 
--- Safe zones (towns) where ring/superwarp phases may execute.
-local safe_zone_names = {
-    'Western Adoulin', 'Eastern Adoulin', 'Celennia Memorial Library',
-    'Ru\'Lude Gardens', 'Upper Jeuno', 'Lower Jeuno', 'Port Jeuno',
-    'Mhaura', 'Selbina', 'Rabao', 'Kazham', 'Norg',
-    'Southern San d\'Oria', 'Northern San d\'Oria', 'Port San d\'Oria',
-    'Bastok Mines', 'Bastok Markets', 'Port Bastok', 'Metalworks',
-    'Windurst Waters', 'Windurst Walls', 'Port Windurst', 'Windurst Woods',
-    'Chocobo Circuit', 'Mog Garden',
-}
-local safe_zone_ids = {}
-for _, name in ipairs(safe_zone_names) do
-    local id = zone_id_of(name)
-    if id then safe_zone_ids[id] = true end
-end
-
--- Crag-teleport zones (where the Dimensional Portal to Reisenjima stands)
-local portal_zone_ids = {}
-for _, key in ipairs({'la_theine', 'konschtat', 'tahrongi'}) do
-    if ZONES[key] then portal_zone_ids[ZONES[key]] = true end
-end
-
--- Conflux tunnel zones
-local conflux_zone_ids = {}
-if ZONES.qufim     then conflux_zone_ids[ZONES.qufim]     = true end
-if ZONES.misareaux then conflux_zone_ids[ZONES.misareaux] = true end
-
--- ==========================================================================
--- ROTATION / TARGET DATA
--- ==========================================================================
--- 1: Reisenjima (Quetzalcoatl), 2: Escha-Zi'Tah (Azi Dahaka), 3: Escha-Ru'Aun (Naga Raja)
-local rotation = {
-    [1] = {label = 'Reisenjima (Quetzalcoatl)',   zone = ZONES.reisenjima, boss = 'Quetzalcoatl'},
-    [2] = {label = "Escha - Zi'Tah (Azi Dahaka)", zone = ZONES.zitah,      boss = 'Azi Dahaka'},
-    [3] = {label = "Escha - Ru'Aun (Naga Raja)",  zone = ZONES.ruaun,      boss = 'Naga Raja'},
-}
+-- Arena anchor per rotation index (used for the target scan radius). For
+-- Zi'Tah / Ru'Aun the anchor is the final arena waypoint.
+rotation[1].arena = reisen_arena
+rotation[2].arena = zitah_arena_wps[#zitah_arena_wps]
+rotation[3].arena = ruaun_arena_wps[#ruaun_arena_wps]
 
 -- Build each zone's full target list: primary boss + every bonus target
 -- (Mireu). `targets` is a name->true set for O(1) lookups during mob scans.
@@ -177,20 +211,7 @@ for _, entry in pairs(rotation) do
     end
 end
 
--- Waypoint paths (x/y pairs)
-local q_waypoints      = { {x=-212.00, y= 94.00}, {x=-207.61, y= 88.76}, {x=-203.64, y= 84.19}, {x=-201.26, y= 81.52}, {x=-203.09, y= 77.94} }
-local m_waypoints      = { {x= -66.00, y=562.00}, {x= -65.22, y=565.10}, {x= -63.39, y=568.49}, {x= -60.10, y=570.39}, {x= -56.77, y=569.21}, {x= -52.69, y=567.83}, {x= -50.37, y=567.07}, {x= -49.57, y=570.27} }
-local zitah_waypoints  = { {x=-345.43, y=-178.93}, {x=-349.69, y=-175.19}, {x=-353.34, y=-171.91}, {x=-355.45, y=-171.26} }
-local ruaun_waypoints  = { {x=  -0.37, y=-466.98}, {x=  -4.43, y=-463.94}, {x=  -9.29, y=-460.63} }
-local zitah_arena_wps  = { {x=  -6.77, y=  52.33}, {x=  -7.74, y=  44.74}, {x=  -8.40, y=  39.76}, {x=  -9.19, y=  33.85} }
-local ruaun_arena_wps  = { {x=   2.25, y=-223.03}, {x=   5.04, y=-217.67}, {x=   6.67, y=-212.86}, {x=   8.38, y=-211.61} }
-local reisen_arena     = {x = 612.17, y = -933.43}
-
--- Arena anchor per rotation index (used for the target scan radius). For
--- Zi'Tah / Ru'Aun the anchor is the final arena waypoint.
-rotation[1].arena = reisen_arena
-rotation[2].arena = zitah_arena_wps[#zitah_arena_wps]
-rotation[3].arena = ruaun_arena_wps[#ruaun_arena_wps]
+local get_missing_trust = trusts.get_missing_trust
 
 -- ==========================================================================
 -- STATE
@@ -199,14 +220,14 @@ local PHASE_NAMES = {
     [0]  = 'Idle / Stopped',
     [1]  = 'Equipping / Using Teleport Ring',
     [2]  = 'Navigating to Dimensional Portal',
-    [3]  = 'Pathing to Eschan Portal',
-    [4]  = 'Requesting Elvorseal',
+    [3]  = 'Approaching Domain Invasion NPC',
+    [4]  = 'Requesting Elvorseal / Warping to Arena',
     [5]  = 'Verifying Elvorseal Buff',
     [6]  = 'Arena Combat & Trusts',
     [7]  = 'Equipping / Using Warp Ring',
-    [8]  = 'Safe Zone - Superwarping',
-    [9]  = 'Pathing to Undulating Confluence',
-    [10] = 'Entering Escha Zone',
+    [8]  = 'Safe Zone - Superwarping (Home Point)',
+    [9]  = 'Approaching Undulating Confluence',
+    [10] = 'Entering Escha',
     [11] = 'Dead - Returning to Home Point',
 }
 
@@ -219,29 +240,41 @@ local state = {
     boss_id            = nil,          -- cached entity ID of the CURRENT target (boss or Mireu)
     boss_missing_since = nil,          -- os.time() when the target vanished from tracking
     target_name        = nil,          -- name of the current target (HUD)
-    last_kill_at       = nil,          -- os.time() of the most recent kill (linger window anchor)
+    pending_advance    = false,        -- kill confirmed; disengaging before advance_rotation()
     kills              = 0,            -- kills this arena visit
-    bonus_seen         = {},           -- bonus target names already announced this visit
+    bonus_seen         = {},           -- alternate-spawn names already announced this visit
     arena_positioned   = false,
-    portal             = nil,          -- Dimensional Portal entity snapshot
-    portal_best_dist   = nil,          -- closest approach to the portal (watchdog progress)
-    elvorseal_sent_at  = nil,          -- os.time() of last Elvorseal request
+    facing_settled     = false,        -- one-tick turn-then-wait latch before the first engage packet
+    approach_npc       = nil,          -- entity snapshot for phase 2/3/9's shared approach-and-interact
+    approach_best_dist = nil,          -- closest approach so far (watchdog progress)
+    wp_path_done       = false,        -- phase 3/9: terrain-following waypoint stage complete
+    domain_menu        = nil,          -- {npc, zone, menu_id, menu_params} captured in phase 3, consumed in phase 4
+    confluence_menu    = nil,          -- {npc, zone, menu_id} captured in phase 9, consumed in phase 10
+    elvorseal_sent_at  = nil,          -- os.time() the Elvorseal sequence completed (phase 5 anchor)
     elvorseal_fails    = 0,
     ring_started_at    = nil,          -- os.time() when the current ring phase began
     ring_equip_sent    = false,
     selected_tp_ring   = nil,          -- which Dim. Ring was picked for this cycle
     phase_started_at   = os.time(),    -- watchdog anchor
     death_latched      = false,        -- home-point packet sent once per death
-    sw_attempts        = 0,            -- superwarp retry counter for phases 8/10
+    sw_attempts        = 0,            -- superwarp retry counter for phase 8
     last_pos           = nil,          -- {x, y, t} for stuck detection
     fail_reason        = nil,          -- surfaced on the HUD
     last_unhandled_zone = nil,
     last_seen_zone     = nil,          -- zone ID observed on the previous tick
     settle_until       = nil,          -- os.time() before which entity interaction is forbidden
     hud_note           = nil,          -- transient status line (settling / zone gate)
-    watchdog_recoveries = 0,           -- soft recoveries used since the last successful travel step
+    watchdog_recoveries = 0,           -- soft recoveries used since the last successful zone change
+    last_recovery_zone = nil,          -- zone ID the recovery budget was last refreshed for
     unknown_zone_since = nil,          -- os.time() we first saw an unrecognized zone
     last_transition    = nil,          -- "phase A -> B (reason)" for //df status
+    sw_signal          = nil,          -- 'retrying' | 'failed', read from Superwarp's own chat output (phase 8 only)
+    sw_signal_at       = nil,          -- os.time() the signal was captured
+    sw_last_sent_at    = nil,          -- os.time() the last sw_* command was issued
+    seq_gen            = 0,            -- bumped on every phase change; invalidates stale action-queue callbacks
+    seq_busy           = false,        -- phase 4/10: an action queue (run_action_queue) is currently in flight
+    ack_wait_gen       = nil,          -- seq_gen value the current step is waiting on an ack for
+    ack_resume         = nil,          -- function to call when that ack (or its timeout) arrives
 }
 
 -- prerender throttle
@@ -319,12 +352,26 @@ local function set_phase(p, reason)
         state.waypoint_index   = 1
         state.last_pos         = nil
         state.sw_attempts      = 0
+        state.seq_gen          = state.seq_gen + 1   -- invalidate any in-flight action-queue callbacks
+        state.seq_busy         = false
+        state.ack_wait_gen     = nil
+        state.ack_resume       = nil
         if p == 1 or p == 7 then
             state.ring_started_at = nil
             state.ring_equip_sent = false
         end
-        if p == 4 then
-            state.elvorseal_sent_at = nil
+        if p == 2 or p == 3 or p == 9 then
+            -- Fresh approach: forget any previously found NPC / progress mark.
+            state.approach_npc       = nil
+            state.approach_best_dist = nil
+        end
+        if p == 3 or p == 9 then
+            -- Fresh interaction: any captured menu snapshot is stale, and the
+            -- terrain-following walk stage (if this zone has one) needs to
+            -- run again from the start.
+            state.domain_menu     = nil
+            state.confluence_menu = nil
+            state.wp_path_done    = false
         end
         if p ~= 6 then
             state.arena_positioned = false
@@ -342,11 +389,6 @@ local function get_zone_id()
     local info = windower.ffxi.get_info()
     if not info or not info.zone or info.zone == 0 then return nil end
     return info.zone
-end
-
-local function zone_name_of(id)
-    local z = id and res.zones[id]
-    return z and z.name or ('Zone #' .. tostring(id or '?'))
 end
 
 local function isBuffActive(id)
@@ -448,6 +490,32 @@ local function chase_mob_by_id(mob_id, range)
     return 'moving'
 end
 
+-- Turns to face `mob`, waits one full tick for that turn to actually land,
+-- THEN fires the engage packet -- rather than firing it in the same tick as
+-- the turn. windower.ffxi.turn() needs at least a moment to rotate the
+-- character; engaging immediately after can catch the client still
+-- mid-turn (reported: "not always facing the mob perfectly when engaging").
+-- Returns true once it has actually sent the engage packet.
+local function engage_when_facing_ready(mob)
+    local me = windower.ffxi.get_mob_by_target('me')
+    if not state.facing_settled then
+        if me and mob then
+            face_towards(mob.x - me.x, mob.y - me.y)
+        end
+        state.facing_settled = true
+        delay = 0.3
+        return false
+    end
+    state.facing_settled = false
+    packets.inject(packets.new('outgoing', 0x01A, {
+        ['Target']       = mob.id,
+        ['Target Index'] = mob.index,
+        ['Category']     = 2,          -- engage
+    }))
+    delay = 1
+    return true
+end
+
 -- ==========================================================================
 -- EQUIPMENT / RING HANDLING
 -- ==========================================================================
@@ -520,42 +588,8 @@ local function process_ring(ring_name)
 end
 
 -- ==========================================================================
--- TRUSTS
+-- TRUSTS (data + lookup live in libs/df_trusts.lua)
 -- ==========================================================================
-local function get_missing_trust()
-    local party = windower.ffxi.get_party()
-    if not party then return nil end
-    if (party.party1_count or 0) >= 6 then return nil end
-
-    local recasts = windower.ffxi.get_spell_recasts() or {}
-    local known   = windower.ffxi.get_spells() or {}
-
-    for _, t in ipairs(trust_list) do
-        local present = false
-        for i = 0, 5 do
-            local member = party['p' .. i]
-            if member and member.mob
-               and (member.mob.name == t.spell or (t.alt and member.mob.name == t.alt)) then
-                present = true
-                break
-            end
-        end
-
-        if not present then
-            for _, name in ipairs({t.spell, t.alt}) do
-                if name and name ~= '' then
-                    local spell = res.spells:with('en', name)
-                    if spell and known[spell.id]
-                       and (recasts[spell.recast_id] or 0) == 0 then
-                        return name
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
 local function try_summon_trust()
     local next_trust = get_missing_trust()
     if next_trust and can_cast() then
@@ -587,13 +621,15 @@ local function arena_distance(mob, entry)
 end
 
 -- Find the Domain Invasion target we should be fighting right now.
---   * Sticky: if our cached target is still alive we keep it (no ping-pong
---     between the boss and Mireu when both are up).
+--   * Sticky: if our cached target is still alive we keep it, rather than
+--     re-scanning every tick. Mireu spawns in place of the zone's dragon,
+--     not alongside it, so this is just cheap consistency, not conflict
+--     resolution between two simultaneous targets.
 --   * Otherwise scan the mob array for any live mob whose name is in the
 --     zone's target set. Names are unique DI bosses, so no radius filter is
 --     applied (the dragons roam far across the arena).
 --   * Prefer a mob already claimed by us, then the closest to the arena anchor.
--- Announces the first sighting of a bonus target (Mireu) once per visit.
+-- Announces the first sighting of an alternate spawn (Mireu) once per visit.
 local function find_di_target()
     local entry = rotation[state.zone_index]
     if not entry or not entry.targets then return nil end
@@ -628,7 +664,7 @@ local function find_di_target()
         state.target_name = best.name
         if best.name ~= entry.boss and not state.bonus_seen[best.name] then
             state.bonus_seen[best.name] = true
-            log(('%s spawned! Adding it to the fight.'):format(best.name))
+            log(('%s spawned in place of %s this visit. Engaging.'):format(best.name, entry.boss))
         end
     end
     return best
@@ -641,51 +677,26 @@ local function reset_arena_tracking()
     state.boss_id            = nil
     state.boss_missing_since = nil
     state.target_name        = nil
-    state.last_kill_at       = nil
+    state.pending_advance    = false
     state.kills              = 0
     state.bonus_seen         = {}
+    state.facing_settled     = false
 end
 
 -- ==========================================================================
--- PATHING
+-- ARENA APPROACH PATH (post-teleport short walk to the boss engagement spot)
 -- ==========================================================================
--- Walks `waypoints`; on completion runs `on_complete` (optional) and switches
--- to `target_phase`. Returns nothing; manages delay itself.
-local function executePath(waypoints, target_phase, on_complete)
-    local me = windower.ffxi.get_mob_by_target('me')
-    if not me then return end
-
-    local wp = waypoints[state.waypoint_index]
-    if not wp then
-        stop_running()
-        if on_complete then on_complete() end
-        set_phase(target_phase, 'path complete')
-        delay = 3
-        return
-    end
-
-    local dist = math.sqrt((wp.x - me.x)^2 + (wp.y - me.y)^2)
-    if dist > settings.waypoint_range then
-        if movement_stuck(me) then
-            stop_running()
-            stop_bot('Movement stuck while pathing (waypoint ' .. state.waypoint_index .. '). Bot stopped.')
-            return
-        end
-        run_towards(wp.x - me.x, wp.y - me.y)
-        delay = 0.1
-    else
-        state.waypoint_index = state.waypoint_index + 1
-        state.last_pos = nil
-        mark_progress()
-    end
-end
-
--- Arena flanking path; returns true once complete.
-local function executeArenaPath(waypoints)
+-- Walks an ordered list of {x, y} waypoints, advancing state.waypoint_index
+-- as each is reached within settings.waypoint_range. Returns true once the
+-- whole list is exhausted. Used for the post-teleport arena walk (phase 6)
+-- and, since v11.1, the terrain-following walk to the Domain NPC / Confluence
+-- (phases 3/9) before the dynamic find-and-interact takes over for the last
+-- stretch. `label` is only used for the stuck-log message.
+local function executeArenaPath(wps, label)
     local me = windower.ffxi.get_mob_by_target('me')
     if not me then return false end
 
-    local wp = waypoints[state.waypoint_index]
+    local wp = wps[state.waypoint_index]
     if not wp then
         stop_running()
         return true
@@ -695,9 +706,8 @@ local function executeArenaPath(waypoints)
     if dist > settings.waypoint_range then
         if movement_stuck(me) then
             stop_running()
-            -- Don't hard-stop mid-combat setup; just accept current position.
-            log('Stuck on arena path; holding position here.')
-            return true
+            log(('Stuck approaching %s; holding position.'):format(label or 'the arena engagement spot'))
+            return false
         end
         run_towards(wp.x - me.x, wp.y - me.y)
         delay = 0.1
@@ -705,8 +715,123 @@ local function executeArenaPath(waypoints)
     else
         state.waypoint_index = state.waypoint_index + 1
         state.last_pos = nil
+        mark_progress()
         return false
     end
+end
+
+-- ==========================================================================
+-- NPC APPROACH (Dimensional Portal / Domain Invasion NPC / Undulating
+-- Confluence) -- one shared, dynamic implementation for all three
+-- ==========================================================================
+local function find_first_mob_by_name(names)
+    for _, name in ipairs(names) do
+        local mob = windower.ffxi.get_mob_by_name(name)
+        if mob then return mob end
+    end
+    return nil
+end
+
+-- Walk to and interact with the nearest live NPC matching any of `names`,
+-- caching the found entity under state.approach_npc so the shared
+-- 'incoming chunk' handler (below) knows which NPC's menu response to
+-- expect. See this file's header comment for why phases 3 and 9 use this
+-- dynamic approach instead of the fixed waypoints they used to.
+local function approach_and_interact(names)
+    local me = windower.ffxi.get_mob_by_target('me')
+    if not me then return end
+
+    -- Always work from a FRESH snapshot. mob.distance is computed at fetch
+    -- time and does not update on a cached table -- even though these NPCs
+    -- are stationary, a stale snapshot's .distance stays frozen at whatever
+    -- it was when first spotted, so the arrival check below would never see
+    -- us as "close enough" no matter how close we actually walked (this was
+    -- the "walks right up and wiggles" bug: a correct live heading, checked
+    -- against a dead distance reading). Once we know the NPC's ID, re-fetch
+    -- it by ID each tick (cheap) instead of re-scanning the whole mob list
+    -- by name (find_first_mob_by_name) every time.
+    local npc = state.approach_npc and windower.ffxi.get_mob_by_id(state.approach_npc.id)
+    if not npc then
+        npc = find_first_mob_by_name(names)
+    end
+    state.approach_npc = npc
+    if not npc then
+        -- Not in tracking range yet; keep checking rather than spinning fast.
+        delay = 2
+        return
+    end
+
+    local dist = math.sqrt(npc.distance or 0)
+    if dist > settings.npc_range then
+        if movement_stuck(me) then
+            stop_running()
+            stop_bot(('Stuck while approaching %s. Bot stopped.'):format(npc.name))
+            return
+        end
+        -- Closing in on the NPC counts as progress for the watchdog.
+        if not state.approach_best_dist or dist < state.approach_best_dist - 1 then
+            state.approach_best_dist = dist
+            mark_progress()
+        end
+        run_towards(npc.x - me.x, npc.y - me.y)
+        delay = 0.1
+    else
+        stop_running()
+        packets.inject(packets.new('outgoing', 0x01A, {
+            ['Target']       = npc.id,
+            ['Target Index'] = npc.index,
+            ['Category']     = 0,          -- NPC interaction
+        }))
+        delay = 5
+    end
+end
+
+-- How long to wait for a menu's own 0x05C acknowledgement before giving up
+-- on it and continuing anyway (keeps a missing/renamed ack from hanging the
+-- bot forever; see run_action_queue).
+local ACK_TIMEOUT = 5
+
+-- Fires a pre-built ordered list of {packet, wait_ack, delay} steps (see
+-- libs/df_eschawarp.lua). Steps with wait_ack=true wait for a real incoming
+-- 0x05C -- the menu's own acknowledgement of the previous selection -- before
+-- the next one fires, rather than a guessed fixed delay; `delay` is unused
+-- for those. Steps with wait_ack=false just wait `delay` seconds. This is
+-- what fixed the "interacting with Affi never warped to the arena" bug:
+-- map/escha.lua's domain sequence waits on this ack for nearly every step,
+-- and firing the next menu selection before the server had processed the
+-- last one silently derailed the sequence.
+-- Guards against stale callbacks from an abandoned sequence (e.g. a
+-- watchdog recovery mid-sequence) via state.seq_gen, which set_phase()
+-- bumps on every transition.
+local function run_action_queue(steps, on_done)
+    local my_gen = state.seq_gen
+    local i = 0
+    local function next_step()
+        if state.seq_gen ~= my_gen then return end   -- superseded; abandon
+        i = i + 1
+        local step = steps[i]
+        if not step then
+            if on_done then on_done() end
+            return
+        end
+        packets.inject(step.packet)
+        if step.wait_ack then
+            state.ack_wait_gen = my_gen
+            state.ack_resume   = next_step
+            coroutine.schedule(function()
+                if state.seq_gen == my_gen and state.ack_wait_gen == my_gen then
+                    warning(('Menu sequence: no ack for step %d within %ds; continuing anyway.'):format(i, ACK_TIMEOUT))
+                    state.ack_wait_gen = nil
+                    state.ack_resume   = nil
+                    next_step()
+                end
+            end, ACK_TIMEOUT)
+        else
+            coroutine.schedule(next_step, step.delay or 0)
+        end
+    end
+    state.seq_busy = true
+    next_step()
 end
 
 -- ==========================================================================
@@ -721,12 +846,27 @@ end
 -- Phase to use when standing INSIDE the target DI zone.
 local function in_target_zone_phase()
     if isBuffActive(settings.elvorseal_buff) then return 6 end
-    return state.zone_index == 1 and 4 or 3
+    return 3   -- approach the Domain Invasion NPC; uniform for all 3 zones (v11)
 end
 
 -- Phase to use when standing in a town / safe zone.
 local function travel_phase_from_town()
     return state.zone_index == 1 and 1 or 8
+end
+
+-- Phase to use when we're somewhere unexpected and need to leave. The Dim.
+-- Ring (phase 1) has no zone gate -- it works from anywhere -- so when the
+-- target is Reisenjima there's no reason to detour home through the Warp
+-- Ring first just to turn around and use the Dim. Ring from there instead.
+-- Superwarp's Home Point menu (phase 8, for Zi'Tah/Ru'Aun) has no such
+-- shortcut; it only works from a proper town, so a Warp Ring trip home
+-- really is required for those two targets. This is exactly what "//df
+-- start" from a conflux zone (e.g. Qufim) while targeting Reisenjima used
+-- to trip on: Qufim matched no positive branch (it's only ever "expected"
+-- when the target is Zi'Tah/Ru'Aun), so it fell through to a blind warp
+-- home even though the ring it needed works from right where it was.
+local function escape_phase()
+    return state.zone_index == 1 and 1 or 7
 end
 
 -- Conflux zone that leads to the current target (nil for Reisenjima).
@@ -741,6 +881,7 @@ end
 local function reroute_from_reality(zone_id, reason)
     stop_running()
     if not zone_id then
+        warning('Zone unknown at "' .. reason .. '" (client still loading/zoning?); warping home to recover.')
         set_phase(7, reason .. '; zone unknown, warping home')
     elseif safe_zone_ids[zone_id] then
         set_phase(travel_phase_from_town(), reason)
@@ -752,7 +893,9 @@ local function reroute_from_reality(zone_id, reason)
     elseif portal_zone_ids[zone_id] and state.zone_index == 1 then
         set_phase(2, reason)
     else
-        set_phase(7, reason .. '; warping home')
+        warning(('"%s" is not in safe_zone_names / any known target/conflux/crag zone at "%s". Add it to libs/df_zones.lua if it is a valid start/home point.')
+                :format(zone_name_of(zone_id), reason))
+        set_phase(escape_phase(), reason .. '; leaving')
     end
 end
 
@@ -794,7 +937,7 @@ local function enforce_zone_reality(zone_id)
         state.unknown_zone_since = nil
         if zone_id ~= expected_conflux_zone() then
             stop_running()
-            set_phase(7, ('in %s but the target is %s; warping home'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
+            set_phase(escape_phase(), ('in %s but the target is %s; leaving'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
         elseif state.phase ~= 9 and state.phase ~= 10 then
             set_phase(9, 'arrived in conflux zone')
         end
@@ -803,7 +946,7 @@ local function enforce_zone_reality(zone_id)
         state.unknown_zone_since = nil
         if state.zone_index ~= 1 then
             stop_running()
-            set_phase(7, ('at a crag but the target is %s; warping home'):format(rotation[state.zone_index].label))
+            set_phase(escape_phase(), ('at a crag but the target is %s; leaving'):format(rotation[state.zone_index].label))
         elseif state.phase ~= 2 then
             set_phase(2, 'arrived at crag')
         end
@@ -814,11 +957,10 @@ local function enforce_zone_reality(zone_id)
             -- Standing in a DI zone that is not the current target (e.g. started
             -- with the wrong argument, or a stale rotation index). Leave.
             stop_running()
-            set_phase(7, ('in %s but the target is %s; warping home'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
+            set_phase(escape_phase(), ('in %s but the target is %s; leaving'):format(zone_name_of(zone_id), rotation[state.zone_index].label))
         else
-            -- Valid arena phases: 4/5/6 for Reisenjima, 3/4/5/6 for Zi'Tah / Ru'Aun.
-            local min_phase = (state.zone_index == 1) and 4 or 3
-            if state.phase < min_phase or state.phase > 6 then
+            -- Valid arena phases: 3/4/5/6, uniform for all three zones (v11).
+            if state.phase < 3 or state.phase > 6 then
                 stop_running()
                 set_phase(in_target_zone_phase(), 'arrived in target zone')
             end
@@ -837,7 +979,7 @@ local function enforce_zone_reality(zone_id)
            and now - state.unknown_zone_since > settings.unknown_zone_grace then
             state.unknown_zone_since = nil
             stop_running()
-            set_phase(7, 'unrecognized zone for ' .. settings.unknown_zone_grace .. 's; warping home')
+            set_phase(escape_phase(), 'unrecognized zone for ' .. settings.unknown_zone_grace .. 's; leaving')
         end
     end
 end
@@ -845,49 +987,51 @@ end
 -- ==========================================================================
 -- PHASE HANDLERS
 -- ==========================================================================
-local function phase_2_portal()
-    local me = windower.ffxi.get_mob_by_target('me')
-    if not me then return end
+-- Phase 4: the Domain NPC's menu was captured in phase 3 (state.domain_menu).
+-- Decide whether the dragon is up; if so, request Elvorseal (if needed) and
+-- warp to the arena; if not, cancel and retry later. See libs/df_eschawarp.lua.
+local function phase_4_domain_menu()
+    if state.seq_busy then return end   -- domain sequence already in flight; wait for its own callbacks
+    local menu = state.domain_menu
+    if not menu then
+        -- No snapshot (e.g. a soft-recovery landed us here directly): go
+        -- re-interact rather than guess.
+        set_phase(3, 'no domain menu captured; retrying interaction')
+        return
+    end
+    state.domain_menu = nil
 
-    state.portal = windower.ffxi.get_mob_by_name('Dimensional Portal')
-    local portal = state.portal
-    if not portal then
-        -- Portal beyond tracking range: warn once via watchdog rather than spin silently.
-        delay = 2
+    local dragon_state, has_elvorseal = eschawarp.read_domain_status(menu.menu_params)
+    if eschawarp.domain_not_ready(dragon_state) then
+        packets.inject(eschawarp.build_domain_cancel(menu))
+        state.elvorseal_fails = state.elvorseal_fails + 1
+        if state.elvorseal_fails >= settings.elvorseal_max then
+            stop_bot(('Domain Invasion not active after %d checks (event inactive / daily cap?). Bot stopped.')
+                     :format(state.elvorseal_fails))
+            return
+        end
+        log(('Domain Invasion not active yet (check %d/%d). Retrying in %ds.')
+            :format(state.elvorseal_fails, settings.elvorseal_max, settings.elvorseal_retry))
+        set_phase(3, 'dragon not ready; retry')
+        delay = settings.elvorseal_retry
         return
     end
 
-    local dist = math.sqrt(portal.distance or 0)
-    if dist > 3 then
-        if movement_stuck(me) then
-            stop_running()
-            stop_bot('Stuck while approaching the Dimensional Portal. Bot stopped.')
-            return
-        end
-        -- Closing in on the portal counts as progress for the watchdog.
-        if not state.portal_best_dist or dist < state.portal_best_dist - 1 then
-            state.portal_best_dist = dist
-            mark_progress()
-        end
-        run_towards(portal.x - me.x, portal.y - me.y)
-        delay = 0.1
-    else
-        stop_running()
-        local p = packets.new('outgoing', 0x01A, {
-            ['Target']       = portal.id,
-            ['Target Index'] = portal.index,
-            ['Category']     = 0,          -- NPC interaction
-        })
-        packets.inject(p)
-        delay = 5
+    state.elvorseal_fails = 0
+    local seq = eschawarp.build_domain_sequence(menu, has_elvorseal)
+    if not seq then
+        stop_bot(('No known arena landing spot for zone %d. Bot stopped.'):format(menu.zone))
+        return
     end
-end
-
-local function phase_4_request_elvorseal()
-    windower.send_command(settings.sw_elvorseal)
-    state.elvorseal_sent_at = os.time()
-    set_phase(5, 'Elvorseal requested')
-    delay = 5
+    log(has_elvorseal and 'Warping to battle...' or 'Getting Elvorseal, then warping to battle...')
+    run_action_queue(seq, function()
+        state.seq_busy = false
+        state.elvorseal_sent_at = os.time()
+        nexttime = os.clock()   -- wake the main loop immediately; total time varied (ack-driven)
+        delay = 0
+        set_phase(5, 'Elvorseal sequence sent')
+    end)
+    delay = 2   -- re-checked periodically while seq_busy guards against re-entry
 end
 
 local function phase_5_verify_elvorseal()
@@ -899,7 +1043,7 @@ local function phase_5_verify_elvorseal()
     if state.elvorseal_sent_at and os.time() - state.elvorseal_sent_at > 10 then
         state.elvorseal_fails = state.elvorseal_fails + 1
         if state.elvorseal_fails >= settings.elvorseal_max then
-            stop_bot(('Elvorseal failed %d times (event inactive / daily cap / Superwarp missing?). Bot stopped.')
+            stop_bot(('Elvorseal failed %d times (event inactive / daily cap / packet sequence out of date?). Bot stopped.')
                      :format(state.elvorseal_fails))
             return
         end
@@ -980,37 +1124,33 @@ local function phase_6_combat(player)
         elseif now - state.boss_missing_since < 6 then
             return
         end
-        -- Confirmed gone: count the kill and open the linger window.
+        -- Confirmed gone. Mireu spawns in place of the zone's dragon, not
+        -- alongside or after it -- exactly one of them is ever up in a given
+        -- visit, and killing whichever one it was clears the arena. No
+        -- reason to linger scanning for a second target that was never
+        -- coming.
         state.fighting = false
         state.boss_missing_since = nil
         state.kills = state.kills + 1
-        state.last_kill_at = now
         stop_running()
-        log(('%s defeated or despawned. Scanning %ds for another target (Mireu)...')
-            :format(state.target_name or target.boss, settings.post_kill_linger))
+        log(('%s defeated or despawned. Arena clear.'):format(state.target_name or target.boss))
         state.boss_id = nil
         state.target_name = nil
-        state.hud_note = 'Post-kill scan for additional targets...'
+        state.pending_advance = true
         if player.status == 1 then
             -- Disengage so we can re-engage a new target (or use a ring later).
             windower.send_command('input /attack off')
             delay = 3
         end
         return
-    elseif state.last_kill_at then
-        -- Linger window after a kill: nothing alive right now. Keep scanning
-        -- until the window expires, then the arena is clear -> move on.
-        if now - state.last_kill_at < settings.post_kill_linger then
-            delay = 1
-            return
-        end
-        state.hud_note = nil
-        log(('Arena clear (%d kill%s). Moving on.'):format(state.kills, state.kills == 1 and '' or 's'))
+    elseif state.pending_advance then
+        -- Disengage completed (or wasn't needed); move on.
         if player.status == 1 then
             windower.send_command('input /attack off')
             delay = 3
             return
         end
+        state.pending_advance = false
         advance_rotation()
         return
     end
@@ -1026,7 +1166,6 @@ local function phase_6_combat(player)
     if not state.fighting and player.status == 0 then
         local me = windower.ffxi.get_mob_by_target('me')
         if not me then return end
-
         if state.zone_index == 1
            and (math.abs(reisen_arena.x - me.x) > 2 or math.abs(reisen_arena.y - me.y) > 2) then
             if movement_stuck(me) then
@@ -1036,9 +1175,9 @@ local function phase_6_combat(player)
                 run_towards(reisen_arena.x - me.x, reisen_arena.y - me.y)
             end
         elseif state.zone_index == 2 and not state.arena_positioned then
-            state.arena_positioned = executeArenaPath(zitah_arena_wps)
+            state.arena_positioned = executeArenaPath(zitah_arena_wps, 'the arena engagement spot')
         elseif state.zone_index == 3 and not state.arena_positioned then
-            state.arena_positioned = executeArenaPath(ruaun_arena_wps)
+            state.arena_positioned = executeArenaPath(ruaun_arena_wps, 'the arena engagement spot')
         else
             stop_running()
             try_summon_trust()
@@ -1053,24 +1192,15 @@ local function phase_6_combat(player)
     if boss and player.status == 0 and state.fighting then
         local result = chase_mob_by_id(boss.id, settings.engage_range)
         if result == 'arrived' then
-            local engage = packets.new('outgoing', 0x01A, {
-                ['Target']       = boss.id,
-                ['Target Index'] = boss.index,
-                ['Category']     = 2,          -- engage
-            })
-            packets.inject(engage)
-            delay = 1
+            engage_when_facing_ready(boss)
         elseif result == 'stuck' then
-            log('Stuck while closing on ' .. (boss.name or target.boss) .. '; engaging from here.')
-            state.last_pos = nil
-            local engage = packets.new('outgoing', 0x01A, {
-                ['Target']       = boss.id,
-                ['Target Index'] = boss.index,
-                ['Category']     = 2,
-            })
-            packets.inject(engage)
-            delay = 1
+            if not state.facing_settled then
+                log('Stuck while closing on ' .. (boss.name or target.boss) .. '; engaging from here.')
+                state.last_pos = nil
+            end
+            engage_when_facing_ready(boss)
         else
+            state.facing_settled = false
             delay = 0.2
         end
     elseif boss and player.status == 1 and state.fighting then
@@ -1089,7 +1219,32 @@ local function phase_6_combat(player)
 end
 
 local function phase_8_superwarp(zone_id)
+    -- Defensive: enforce_zone_reality() should never leave the router here
+    -- while the target is Reisenjima, but if a future edit to the router
+    -- ever reopens that path, self-correct instead of silently spamming the
+    -- wrong Superwarp command forever.
+    if state.zone_index == 1 then
+        set_phase(1, 'phase 8 guard: target is Reisenjima, use the Dim. Ring, not Superwarp')
+        return
+    end
     if not safe_zone_ids[zone_id] then return end
+
+    if state.sw_signal == 'retrying' then
+        -- Superwarp is already re-issuing this call on its own; don't stack
+        -- a second command on top of its retry loop, just wait it out a
+        -- little longer and re-check.
+        state.sw_signal = nil
+        mark_progress()
+        delay = 3
+        return
+    end
+    -- A 'failed' signal means Superwarp already gave up on this attempt, so
+    -- fall through and resend now instead of waiting out the rest of the
+    -- delay. No signal at all (unrecognized message / different Superwarp
+    -- version) falls through too, on the original fixed 15s cadence -- this
+    -- degrades gracefully to the old timer-only behavior.
+    state.sw_signal = nil
+
     state.sw_attempts = state.sw_attempts + 1
     if state.sw_attempts > 6 then
         stop_bot('Superwarp HP warp is not zoning us (is Superwarp loaded / HP unlocked?). Bot stopped.')
@@ -1100,18 +1255,67 @@ local function phase_8_superwarp(zone_id)
     elseif state.zone_index == 3 then
         windower.send_command(settings.sw_misareaux)
     end
+    state.sw_last_sent_at = os.time()
     delay = 15
 end
 
-local function phase_10_enter_escha(zone_id)
-    if not conflux_zone_ids[zone_id] then return end
-    state.sw_attempts = state.sw_attempts + 1
-    if state.sw_attempts > 6 then
-        stop_bot('Escha entry via Superwarp is not zoning us (is Superwarp loaded / Eschan portal unlocked?). Bot stopped.')
+-- Two-stage NPC approach: walk a known terrain-following waypoint path (if
+-- one exists for the current zone) first, THEN switch to the dynamic
+-- find-and-interact for the last stretch. A straight-line vector walk alone
+-- (approach_and_interact on its own) can't route around a wall or ledge
+-- between the zone entrance and the NPC -- that's what the fixed path is
+-- for. The dynamic step on top of it is still worth keeping even with the
+-- path restored: it's what fixed the original "too far / no eschan npcs
+-- found" crash, since a hardcoded path alone only ever gets you *close*,
+-- not guaranteed within interact range or correctly facing/targeting a
+-- specific live entity.
+local function approach_via_waypoints_then_interact(wps, names, label)
+    if wps and not state.wp_path_done then
+        if executeArenaPath(wps, label) then
+            state.wp_path_done = true
+            state.last_pos = nil
+        end
         return
     end
-    windower.send_command(settings.sw_enter_escha)
-    delay = 15
+    approach_and_interact(names)
+end
+
+-- Phase 9: approach the Undulating Confluence. Phase 10: the confluence's
+-- menu was captured in phase 9 (state.confluence_menu); fire the "enter"
+-- sequence. See libs/df_eschawarp.lua.
+local function phase_9_approach_confluence()
+    if state.zone_index == 1 then
+        -- Defensive: Reisenjima never routes through the conflux; if this
+        -- ever fires anyway, self-correct with the Dim. Ring (works from
+        -- anywhere) instead of detouring home first.
+        set_phase(escape_phase(), 'phase 9 guard: Reisenjima has no conflux step')
+        return
+    end
+    local wps = (state.zone_index == 2 and q_waypoints) or (state.zone_index == 3 and m_waypoints) or nil
+    approach_via_waypoints_then_interact(wps, eschawarp.CONFLUENCE_NPC_NAMES, 'the Undulating Confluence')
+end
+
+local function phase_10_enter_escha_menu()
+    if state.zone_index == 1 then
+        set_phase(escape_phase(), 'phase 10 guard: Reisenjima has no conflux step')
+        return
+    end
+    if state.seq_busy then return end   -- enter sequence already in flight
+    local menu = state.confluence_menu
+    if not menu then
+        set_phase(9, 'no confluence menu captured; retrying interaction')
+        return
+    end
+    state.confluence_menu = nil
+
+    log('Entering Escha...')
+    local seq = eschawarp.build_enter_sequence(menu)
+    run_action_queue(seq, function()
+        state.seq_busy = false
+        -- No explicit set_phase here: the reality router picks up the real
+        -- zone change on its own once it happens.
+    end)
+    delay = 2
 end
 
 -- ==========================================================================
@@ -1124,11 +1328,14 @@ end
 local function watchdog_recover(zone_id)
     local before = state.phase
     stop_running()
-    state.waypoint_index   = 1
-    state.last_pos         = nil
-    state.portal           = nil
-    state.portal_best_dist = nil
-    state.sw_attempts      = 0
+    state.waypoint_index    = 1
+    state.last_pos          = nil
+    state.approach_npc       = nil
+    state.approach_best_dist = nil
+    state.domain_menu        = nil
+    state.confluence_menu    = nil
+    state.wp_path_done       = false
+    state.sw_attempts       = 0
     state.elvorseal_sent_at = nil
 
     if state.phase == 11 then
@@ -1156,7 +1363,7 @@ local function expected_zones_for_phase(phase)
     if phase == 2 then
         return portal_zone_ids
     elseif phase >= 3 and phase <= 6 then
-        -- Eschan portal pathing, Elvorseal and combat: only in THE target zone.
+        -- Domain NPC approach, Elvorseal and combat: only in THE target zone.
         if target and target.zone then return {[target.zone] = true} end
         return {}
     elseif phase == 8 then
@@ -1203,6 +1410,19 @@ windower.register_event('prerender', function()
     local player = windower.ffxi.get_player()
     if not player then return end
 
+    -- A leg that hops through several zones (town -> conflux -> Escha) used
+    -- to share one watchdog_recoveries budget across every hop. Refresh it
+    -- on every actual zone change instead, so a couple of small unrelated
+    -- hiccups a leg apart don't add up to a hard stop.
+    if state.last_recovery_zone ~= zone_id then
+        if state.last_recovery_zone ~= nil and state.watchdog_recoveries > 0 then
+            log(('Watchdog: recovery budget refreshed (0/%d) after reaching %s.')
+                :format(settings.watchdog_recoveries, zone_name_of(zone_id)))
+        end
+        state.last_recovery_zone  = zone_id
+        state.watchdog_recoveries = 0
+    end
+
     -- Global death check (any phase).
     if (player.status == 2 or player.status == 3) and state.phase ~= 11 then
         handle_death(player)
@@ -1239,7 +1459,7 @@ windower.register_event('prerender', function()
 
     -- Zone confirmation gate: phases that touch NPCs/mobs only execute when
     -- we are physically in the zone they expect (e.g. never look for the
-    -- eschan portal while still standing in Qufim).
+    -- Domain Invasion NPC while still standing in Qufim).
     if not zone_gate_open(zone_id) then
         state.hud_note = 'Waiting for zone: ' .. zone_name_of(zone_id) .. ' is not the expected zone'
         stop_running()
@@ -1261,12 +1481,11 @@ windower.register_event('prerender', function()
             log('Using ' .. state.selected_tp_ring .. ' for this cycle.')
         end
         process_ring(state.selected_tp_ring)
-    elseif p == 2  then phase_2_portal()
+    elseif p == 2  then approach_and_interact({'Dimensional Portal'})
     elseif p == 3  then
-        if     state.zone_index == 2 then executePath(zitah_waypoints, 4)
-        elseif state.zone_index == 3 then executePath(ruaun_waypoints, 4)
-        else   set_phase(4, 'Reisenjima has no portal path; go straight to Elvorseal') end
-    elseif p == 4  then phase_4_request_elvorseal()
+        local wps = (state.zone_index == 2 and zitah_waypoints) or (state.zone_index == 3 and ruaun_waypoints) or nil
+        approach_via_waypoints_then_interact(wps, eschawarp.DOMAIN_NPC_NAMES, 'the Domain Invasion NPC')
+    elseif p == 4  then phase_4_domain_menu()
     elseif p == 5  then phase_5_verify_elvorseal()
     elseif p == 6  then phase_6_combat(player)
     elseif p == 7  then
@@ -1277,11 +1496,8 @@ windower.register_event('prerender', function()
             process_ring(settings.warp_ring)
         end
     elseif p == 8  then phase_8_superwarp(zone_id)
-    elseif p == 9  then
-        if     state.zone_index == 2 then executePath(q_waypoints, 10, function() windower.send_command(settings.sw_enter_escha) end)
-        elseif state.zone_index == 3 then executePath(m_waypoints, 10, function() windower.send_command(settings.sw_enter_escha) end)
-        else   stop_running(); set_phase(7, 'conflux path has no meaning for Reisenjima; warping home') end
-    elseif p == 10 then phase_10_enter_escha(zone_id)
+    elseif p == 9  then phase_9_approach_confluence()
+    elseif p == 10 then phase_10_enter_escha_menu()
     elseif p == 11 then phase_11_dead(player)
     end
 end)
@@ -1293,8 +1509,15 @@ windower.register_event('zone change', function(new_id, old_id)
     nexttime = os.clock()
     delay = 8
     -- Clear anything that must not survive a zone line.
-    state.portal          = nil
-    state.portal_best_dist = nil
+    state.approach_npc       = nil
+    state.approach_best_dist = nil
+    state.domain_menu        = nil
+    state.confluence_menu    = nil
+    state.wp_path_done       = false
+    state.seq_gen            = state.seq_gen + 1
+    state.seq_busy           = false
+    state.ack_wait_gen       = nil
+    state.ack_resume         = nil
     reset_arena_tracking()
     state.waypoint_index  = 1
     state.last_pos        = nil
@@ -1318,42 +1541,112 @@ windower.register_event('logout', function()
     end
 end)
 
--- NPC menu automation for the Dimensional Portal (phase 2).
+-- Read Superwarp's OWN chat output instead of only trusting a fixed timer,
+-- for phase 8 (the only phase left that drives a Superwarp command). Read
+-- this file's header + libs/df_eschawarp.lua's header for why phases 4/10
+-- no longer need this. Superwarp logs its NPC-lookup failures as
+-- "No <x> found!" (terminal) or "No <x> found! Retrying..." (it is already
+-- handling the problem itself). We deliberately match on that one shared
+-- substring rather than hardcoding every message Superwarp can print
+-- (version-specific and not something we vendor), so this degrades
+-- gracefully -- if Superwarp's phrasing doesn't match, sw_signal simply
+-- never gets set and phase 8 falls back to the old fixed-delay/attempt-
+-- counter behavior unchanged. Not verified against a live client -- watch
+-- //df status and the chat log to confirm it's actually catching the message.
+windower.register_event('incoming text', function(original, modified)
+    if not state.running then return end
+    if state.phase ~= 8 then return end
+    local text = modified or original
+    if not text or not text:find('found!', 1, true) then return end
+
+    if text:find('Retrying', 1, true) then
+        -- Superwarp is already retrying this call on its own; make sure our
+        -- watchdog doesn't also fire underneath its retry loop, and don't
+        -- stack a second command from our side on the next tick.
+        state.sw_signal = 'retrying'
+        mark_progress()
+    else
+        -- Superwarp gave up on this attempt. Wake the main loop up on the
+        -- very next frame instead of leaving it to wait out the rest of the
+        -- fixed 15s delay before phase 8 gets a chance to retry.
+        state.sw_signal = 'failed'
+        nexttime = os.clock()
+        delay = 0
+    end
+    state.sw_signal_at = os.time()
+end)
+
+-- Menu-open packets for every NPC we interact with directly: the
+-- Dimensional Portal (phase 2), the Domain Invasion NPC (phase 3) and the
+-- Undulating Confluence (phase 9). Reads Menu ID / Zone / Menu Parameters
+-- from the packet itself rather than hardcoding them.
 windower.register_event('incoming chunk', function(id, original, modified, injected, blocked)
     if injected or blocked then return end
-    if id ~= 0x032 and id ~= 0x034 then return end
-    if not state.running or state.phase ~= 2 then return end
 
-    local portal = state.portal
-    if not portal then return end
+    -- Menu-selection acknowledgement for the ack-aware action queue
+    -- (run_action_queue), used by phase 4's Elvorseal/warp-to-arena
+    -- sequence. Not blocked -- the client's own menu state should still see
+    -- it; we're just listening in to know when it's safe to fire the next
+    -- selection.
+    if id == 0x05C then
+        if state.running and state.ack_wait_gen and state.ack_wait_gen == state.seq_gen then
+            local resume = state.ack_resume
+            state.ack_wait_gen = nil
+            state.ack_resume   = nil
+            if resume then resume() end
+        end
+        return
+    end
+
+    if id ~= 0x032 and id ~= 0x034 then return end
+    if not state.running then return end
+    if state.phase ~= 2 and state.phase ~= 3 and state.phase ~= 9 then return end
+
+    local npc = state.approach_npc
+    if not npc then return end
 
     local parsed = packets.parse('incoming', modified or original)
-    if not parsed or parsed['NPC'] ~= portal.id then return end
+    if not parsed or parsed['NPC'] ~= npc.id then return end
 
-    -- Use the authoritative values carried by the menu packet itself.
     local menu_id = parsed['Menu ID']
     local zone_id = parsed['Zone'] or get_zone_id()
     if not menu_id or not zone_id then return end
 
-    -- Select the Reisenjima warp option, then release the menu after a beat.
-    packets.inject(packets.new('outgoing', 0x05B, {
-        ['Target']            = portal.id,
-        ['Target Index']      = portal.index,
-        ['Option Index']      = 0,
-        ['Automated Message'] = true,
-        ['Zone']              = zone_id,
-        ['Menu ID']           = menu_id,
-    }))
-    coroutine.schedule(function()
+    if state.phase == 2 then
+        -- Dimensional Portal: select the Reisenjima warp option, then
+        -- release the menu after a beat.
         packets.inject(packets.new('outgoing', 0x05B, {
-            ['Target']            = portal.id,
-            ['Target Index']      = portal.index,
-            ['Option Index']      = 2,
-            ['Automated Message'] = false,
+            ['Target']            = npc.id,
+            ['Target Index']      = npc.index,
+            ['Option Index']      = 0,
+            ['Automated Message'] = true,
             ['Zone']              = zone_id,
             ['Menu ID']           = menu_id,
         }))
-    end, 0.5)
+        coroutine.schedule(function()
+            packets.inject(packets.new('outgoing', 0x05B, {
+                ['Target']            = npc.id,
+                ['Target Index']      = npc.index,
+                ['Option Index']      = 2,
+                ['Automated Message'] = false,
+                ['Zone']              = zone_id,
+                ['Menu ID']           = menu_id,
+            }))
+        end, 0.5)
+
+    elseif state.phase == 3 then
+        state.domain_menu = {
+            npc         = npc,
+            zone        = zone_id,
+            menu_id     = menu_id,
+            menu_params = parsed['Menu Parameters'],
+        }
+        set_phase(4, 'Domain NPC menu captured')
+
+    elseif state.phase == 9 then
+        state.confluence_menu = {npc = npc, zone = zone_id, menu_id = menu_id}
+        set_phase(10, 'Confluence menu captured')
+    end
 
     return true   -- block the client-side menu so it cannot race our response
 end)
@@ -1362,6 +1655,18 @@ end)
 -- COMMANDS
 -- ==========================================================================
 local function cmd_start(zone_arg)
+    local zone_id = get_zone_id()
+    if not zone_id then
+        -- Client still loading/zoning right as the command came in. Retrying
+        -- beats routing on a nil zone, which reroute_from_reality can only
+        -- resolve by defaulting to the Warp Ring -- wrong regardless of what
+        -- the actual target is (e.g. Reisenjima needs the Dim. Ring, not a
+        -- warp home).
+        log('Zone not yet known (loading/zoning?); retrying //df start in 2s...')
+        coroutine.schedule(function() cmd_start(zone_arg) end, 2)
+        return
+    end
+
     state.fail_reason      = nil
     state.arena_positioned = false
     state.waypoint_index   = 1
@@ -1373,11 +1678,17 @@ local function cmd_start(zone_arg)
     state.last_seen_zone   = nil      -- force a settle window on the first tick
     state.settle_until     = nil
     state.watchdog_recoveries = 0
+    state.last_recovery_zone  = nil
     state.unknown_zone_since  = nil
-    state.portal_best_dist    = nil
+    state.approach_npc        = nil
+    state.approach_best_dist  = nil
+    state.domain_menu         = nil
+    state.confluence_menu     = nil
+    state.wp_path_done        = false
+    state.sw_signal           = nil
+    state.sw_signal_at        = nil
+    state.sw_last_sent_at     = nil
     if hud then hud:show() end
-
-    local zone_id = get_zone_id()
 
     -- No explicit target and we are already standing in a DI zone: farm THIS
     -- zone rather than warping out to go to Reisenjima (the most common
@@ -1413,7 +1724,7 @@ local function cmd_start(zone_arg)
     state.running = true
     nexttime = os.clock()
     delay = 1
-    log('DomainFarm started. NOTE: the Superwarp addon must be loaded for travel to work.')
+    log('DomainFarm started. NOTE: the Superwarp addon must be loaded for Home Point warps (Zi\'Tah/Ru\'Aun legs).')
     update_hud()
 end
 
