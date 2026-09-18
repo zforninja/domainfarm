@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 11.4
+**Version:** 11.5
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the **Mireu** spawn.
@@ -21,6 +21,8 @@ As of **v11**, Superwarp is used for exactly one thing: the Home Point warps to 
 - **Self-Healing State Machine:** If you manually warp, zone, die, or a ring is on cooldown, the bot re-derives the correct phase from where you physically are and resumes.
 - **Superwarp only for Home Points:** `sw hp qufim island` / `sw hp misareaux coast` (explicit `hp` avoids Survival Guide ambiguity). Superwarp's own "No … found! Retrying…" chat lines are read to retry / fail fast instead of waiting on the watchdog.
 - **Smart Combat Positioning:** Paths to the flank of each dragon using per-zone waypoints to keep Trusts out of frontal breath cleaves.
+- **Corrected heading math (v11.5):** `heading_of()` now uses `-atan2(dy, dx)`, matching every working Windower movement/follow addon checked. The old positive `atan2` was a mirror-flipped heading — correct only due east/west, increasingly wrong elsewhere — and was the most likely cause of "attacking while facing away from the mob". The `vector` movement mode (default) was never affected because it passes raw `dx/dy` to `windower.ffxi.run()` without going through `heading_of()`.
+- **Wider inventory scan (v11.5):** `item_in_inventory()` now uses `ipairs()` over the bag table (matching every real Windower addon) instead of a `for i=1,contents.max` loop that relied on a `.max` field `get_items()` doesn't actually return. Also checks Wardrobe 5–8 (bags 13–16) in addition to Wardrobe 1–4.
 - **Face-then-engage (v11.3):** Turns to the mob, waits a tick, then engages — fixes the "attack on while not facing the mob" miss. The stuck-engage fallback faces first too.
 - **Coordinate-Based Chase:** Steers with `windower.ffxi.run()` toward the mob's actual position — independent of the game's TargetLock setting.
 - **Phantom Spawn Detection:** Filters by `valid_target` and `spawn_type` so only real, engageable dragons are targeted.
@@ -236,7 +238,11 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 
 ## 📝 Changelog
 
-### v11.4 (Current)
+### v11.5 (Current)
+- **Fixed mirror-flipped heading.** `heading_of()` was computing `atan2(dy, dx)` — every working Windower movement/follow addon found uses `-atan2(dy, dx)` instead. The unnegated version produces a heading that's mirrored around the east-west axis: correct at 0° and 180°, increasingly wrong elsewhere. This almost certainly explains reports of "still attacking while facing away from the mob". The default `vector` movement mode (which passes `dx/dy` directly to `windower.ffxi.run()`) was never affected — only `turn()` calls (facing before engage, face-then-engage in v11.3) went through `heading_of()`.
+- **Fixed inventory scan.** `item_in_inventory()` iterated with `for i = 1, (contents.max or 0)`, but `get_items()` doesn't return a `.max` field — every real Windower addon uses `ipairs()` over the bag table. Switched to `ipairs()`. Also widened the bag list to include Wardrobe 5–8 (bags 13–16) alongside inventory + Wardrobe 1–4, so rings in newer wardrobes are found. (Note: Wardrobe 5–8 availability depends on a known Windower/private-server inconsistency in client-side vs. server-side unlock detection; if a ring specifically in one of those four bags still isn't found, that's a limitation outside DomainFarm's control.)
+
+### v11.4
 - **Mireu spawns in place of the dragon, not alongside/after it.** The 45-second `post_kill_linger` scan (v10.2) was built on the wrong assumption and only added dead time to every visit. Removed: a kill now goes disengage → `advance_rotation()` immediately. Mireu stays in every zone's target set and is fought exactly like the dragon.
 
 ### v11.3
