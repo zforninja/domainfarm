@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v11.4
+    DomainFarm v11.5
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -22,6 +22,31 @@
         is done natively with our own packets. See "v11: dropped the
         Superwarp dependency for..." below for why Home Point warping alone
         was deliberately NOT brought in-house.
+
+    v11.5: two fixes, both cross-checked against real working Windower
+    addon source rather than guessed:
+      - heading_of() was computing atan2(dy, dx) directly. Checked against
+        several independent, working Windower movement/follow addons found
+        in the wild -- they all negate this (-atan2(dy, dx)). The unnegated
+        version produces a mirror-flipped heading, correct only when the
+        target is due east or west -- almost certainly why the character
+        would sometimes keep attacking while facing away from the mob.
+        run_towards()'s default 'vector' mode was never affected (it passes
+        dx/dy straight to windower.ffxi.run(), never through heading_of()),
+        which is why chasing/approaching was never reported as wrong -- only
+        facing (which always goes through turn(), and so always through
+        heading_of()) was.
+      - item_in_inventory() iterated a bag's contents as `for i = 1,
+        (contents.max or 0) do contents[i] ... end`. Every real Windower
+        addon that scans a bag does it with ipairs(get_items(bag)) instead;
+        none reference a `.max` field, which doesn't appear to actually
+        exist on what get_items() returns. Switched to ipairs(), and widened
+        the bag list to include Wardrobe 5-8 (13-16), not just Wardrobe 1-4
+        (0, 8, 10-12). Note: there's a documented Windower/private-server
+        inconsistency in how Wardrobe 5-8 get detected at all (different
+        client-side vs. server-side logic) -- if a ring specifically in one
+        of those four is still not found, that's a known limitation outside
+        what this addon can work around.
 
     v11.4: Mireu doesn't spawn after a zone's dragon is killed -- it spawns
     in place of it (exactly one of the two is ever up per visit). The old
@@ -113,7 +138,7 @@
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '11.4'
+_addon.version  = '11.5'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -445,9 +470,14 @@ end
 -- on the client's auto-run-to-target, so behaviour is independent of the
 -- in-game TargetLock setting.
 local function heading_of(dx, dy)
-    -- FFXI heading: 0 = +X, increasing clockwise when viewed from above;
-    -- Windower's run(radians)/turn(radians) accept this convention directly.
-    return math.atan2(dy, dx)
+    -- Checked against several independent, working Windower movement/follow
+    -- addons: they all compute this as -atan2(dy, dx), not the plain
+    -- (positive) atan2(dy, dx) this used to be. The unnegated version is a
+    -- mirror-flipped heading -- correct only when the target is due east or
+    -- west, increasingly wrong elsewhere -- which lines up with "still
+    -- attacking and facing away from the mob" far better than a pure
+    -- timing issue would.
+    return -math.atan2(dy, dx)
 end
 
 local function run_towards(dx, dy)
@@ -537,12 +567,21 @@ end
 local function item_in_inventory(name)
     local item_res = res.items:with('en', name)
     if not item_res then return false end
-    -- 0 = inventory, 8 = wardrobe, 10-12 = wardrobes 2-4 (equippable bags)
-    for _, bag in ipairs({0, 8, 10, 11, 12}) do
+    -- 0 = inventory, 8/10/11/12 = Wardrobe/2/3/4 (Windower's own wiki lists
+    -- these as the only bags item functions officially document), plus
+    -- 13-16 = Wardrobe 5-8 on characters that have them unlocked. Iterate
+    -- with ipairs() over the bag's own table -- every real Windower addon
+    -- that scans a bag does it this way. The previous `for i = 1,
+    -- (contents.max or 0) do` relied on a `.max` field that doesn't appear
+    -- to actually exist on what get_items() returns, which is a much
+    -- better explanation for "found in inventory, not found in wardrobe"
+    -- than a genuinely missing bag ID would be -- whatever inconsistency
+    -- let it work at all was likely bag-shape-dependent, not something
+    -- worth relying on further.
+    for _, bag in ipairs({0, 8, 10, 11, 12, 13, 14, 15, 16}) do
         local contents = windower.ffxi.get_items(bag)
         if contents then
-            for i = 1, (contents.max or 0) do
-                local it = contents[i]
+            for _, it in ipairs(contents) do
                 if it and it.id == item_res.id then return true end
             end
         end

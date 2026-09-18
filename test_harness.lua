@@ -588,7 +588,7 @@ assert(esc, 'unrecognized zone must fall back to a ring escape after the grace p
 print('== unknown zone escape OK ==')
 
 cmd('stop')
-print('== ALL v11.4 RESILIENCE TESTS PASSED ==')
+print('== ALL v11.5 RESILIENCE TESTS PASSED ==')
 
 -- 13. stop resets cleanly
 cmd('stop'); cmd('status')
