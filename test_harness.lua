@@ -115,7 +115,13 @@ package.loaded['resources'] = {zones=zones, items=items, spells=spells,
     buffs=make_dict({{id=603, en='Elvorseal'}})}
 package.loaded['packets'] = {
     new = function(dir, id, fields) return {dir=dir, id=id, fields=fields or {}} end,
-    inject = function(p) table.insert(world.injected, p) end,
+    inject = function(p)
+        -- v11.6: the Escha Beads/Silt request (0x115) is HUD bookkeeping,
+        -- not gameplay; keep it out of the "no packets while settling / in
+        -- the wrong zone" assertions and count it separately.
+        if p.id == 0x115 then world.currency_requests = (world.currency_requests or 0) + 1; return end
+        table.insert(world.injected, p)
+    end,
     parse = function(dir, data) return data end,   -- tests pass parsed tables directly
     build = function(p) return '' end,
 }
@@ -126,7 +132,7 @@ function error(...) print('[err]', ...) end  -- logger overrides error() in Wind
 package.loaded['texts'] = {
     new = function() return {
         show=function() end, hide=function() end,
-        text=function() end, destroy=function() end} end,
+        text=function(self, t) world.hud_text = t end, destroy=function() end} end,
 }
 
 coroutine.schedule = function(fn, t) fn() end  -- run scheduled work immediately
@@ -433,7 +439,14 @@ assert(count_cmd('/attack off') >= 1, 'expected disengage after kill')
 world.player.status = 0
 tick(2, 4)                                          -- disengaged -> advance_rotation -> phase 7
 assert(count_cmd('Warp Ring') >= 1, 'v11.4: kill must advance the rotation immediately (no 45s linger)')
-print('== kill -> immediate advance (no linger) OK ==')
+-- v11.6: the kill must survive advance_rotation()'s arena reset and be on
+-- the HUD outside phase 6 (it used to be zeroed in the same tick it was
+-- counted, and only drawn while in phase 6).
+assert(world.hud_text and world.hud_text:find('Kills: \\cs(255,200,100)1', 1, true),
+       'session kill counter must read 1 after the first kill, got: ' .. tostring(world.hud_text))
+assert(world.hud_text:find('Azi Dahaka 1', 1, true), 'per-target kill breakdown must list Azi Dahaka 1')
+assert((world.currency_requests or 0) >= 1, 'a kill must trigger an Escha Beads refresh request (0x115)')
+print('== kill -> immediate advance (no linger) + kill counter OK ==')
 
 -- 21. (v11.4) Mireu spawned IN PLACE of the dragon: engaged and, once it dies,
 --     the rotation advances the same way.
@@ -453,7 +466,9 @@ tick(1, 1); tick(1, 7); tick(1, 7)
 world.player.status = 0
 tick(2, 4)
 assert(count_cmd('Warp Ring') >= 1, 'Mireu kill must advance the rotation')
-print('== Mireu kill -> advance OK ==')
+assert(world.hud_text:find('Kills: \\cs(255,200,100)2', 1, true) and world.hud_text:find('Mireu 1', 1, true),
+       'session total must be 2 with Mireu 1 in the breakdown, got: ' .. tostring(world.hud_text))
+print('== Mireu kill -> advance + counter OK ==')
 
 -- 22. Sticky target: whichever DI mob was acquired first stays the target
 --     even if another candidate wanders closer (no ping-pong).
@@ -587,8 +602,26 @@ end
 assert(esc, 'unrecognized zone must fall back to a ring escape after the grace period')
 print('== unknown zone escape OK ==')
 
+-- 29. (v11.6) Escha Beads on the HUD: '?' until a Currency Info 2 (0x118)
+--     reply arrives, then the parsed 'Escha Beads' / 'Escha Silt' values.
+--     //df beads asks again; //df resetkills zeroes the session tally.
+cmd('stop'); cmd('start', 'zitah')
+assert(world.hud_text:find('Escha Beads: \\cs(180,255,180)?', 1, true), 'beads must read ? before any 0x118')
+local asked = world.currency_requests or 0
+cmd('beads')
+assert((world.currency_requests or 0) == asked + 1, '//df beads must inject one 0x115 request')
+events['incoming chunk'](0x118, {['Escha Beads'] = 1234, ['Escha Silt'] = 56789}, nil, false, false)
+assert(world.hud_text:find('Escha Beads: \\cs(180,255,180)1234', 1, true), 'HUD must show parsed Escha Beads')
+assert(world.hud_text:find('Silt: \\cs(180,255,180)56789', 1, true), 'HUD must show parsed Escha Silt')
+events['incoming chunk'](0x118, {['Escha Beads'] = 1300}, nil, true, false)   -- injected copy: ignored
+assert(world.hud_text:find('1234', 1, true), 'injected 0x118 must be ignored')
+cmd('resetkills')
+assert(world.hud_text:find('Kills: \\cs(255,200,100)0', 1, true), 'resetkills must zero the counter')
+cmd('status')
+print('== Escha Beads HUD + resetkills OK ==')
+
 cmd('stop')
-print('== ALL v11.5 RESILIENCE TESTS PASSED ==')
+print('== ALL v11.6 RESILIENCE TESTS PASSED ==')
 
 -- 13. stop resets cleanly
 cmd('stop'); cmd('status')

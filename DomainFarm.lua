@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v11.5
+    DomainFarm v11.6
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -22,6 +22,32 @@
         is done natively with our own packets. See "v11: dropped the
         Superwarp dependency for..." below for why Home Point warping alone
         was deliberately NOT brought in-house.
+
+    v11.6: two HUD fixes/additions:
+      - The kill counter never showed anything but 0. state.kills was
+        incremented in phase 6 and then, in the very same tick, zeroed by
+        advance_rotation() -> reset_arena_tracking() -- and the HUD only
+        drew it while in phase 6, i.e. exactly the window in which it was
+        always 0. Kills are now counted in a session-wide tally
+        (state.total_kills, plus a per-name breakdown in state.kill_log)
+        that no phase transition touches; it is shown on the HUD in every
+        phase and by //df status, and only //df resetkills (or reloading the
+        addon) clears it. The per-visit counter is gone.
+      - New HUD line showing the character's Escha Beads (and Silt). The
+        client only tells us these via the "Currency Info 2" packet
+        (incoming 0x118), which the server sends in reply to an outgoing
+        0x115 request (what the client sends when you open the Currencies 2
+        menu). DomainFarm injects that request on //df start, every
+        settings.currency_refresh seconds while running, and right after a
+        kill is counted, then reads 'Escha Beads' / 'Escha Silt' out of the
+        parsed 0x118. Shown as "?" until the first reply arrives. Packet
+        IDs and field names were checked against Windower's
+        packets/fields.lua (outgoing 0x115 "Currency 2 Menu", incoming
+        0x118 'Escha Beads' u16 @0x4A / 'Escha Silt' s32 @0x4C) but not
+        against a live client -- if the server doesn't answer an injected
+        0x115 the HUD just keeps showing "?" (open the Currencies 2 menu
+        once by hand; that reply is read too).
+        //df beads forces a refresh and logs the values.
 
     v11.5: two fixes, both cross-checked against real working Windower
     addon source rather than guessed:
@@ -138,7 +164,7 @@
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '11.5'
+_addon.version  = '11.6'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -180,6 +206,10 @@ local settings = {
     -- ever up in a given visit), so it's added to every zone's target set
     -- and fought the same way the dragon would be.
     bonus_targets   = {'Mireu'},
+    -- HUD: how often (seconds) to re-request the Escha Beads / Silt
+    -- balance (outgoing 0x115 -> incoming 0x118) while running. 0 = only on
+    -- start / after kills / //df beads.
+    currency_refresh = 60,
     -- Resilience
     watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt before stopping (refreshed per zone change)
     unknown_zone_grace  = 30,              -- seconds to sit in an unrecognized zone before warping home (0 = never)
@@ -266,7 +296,11 @@ local state = {
     boss_missing_since = nil,          -- os.time() when the target vanished from tracking
     target_name        = nil,          -- name of the current target (HUD)
     pending_advance    = false,        -- kill confirmed; disengaging before advance_rotation()
-    kills              = 0,            -- kills this arena visit
+    total_kills        = 0,            -- session-wide DI kills (never reset by phase changes; //df resetkills clears)
+    kill_log           = {},           -- session-wide kills by target name, e.g. {['Azi Dahaka'] = 2, Mireu = 1}
+    escha_beads        = nil,          -- last Escha Beads balance seen in an incoming 0x118 (nil = not yet received)
+    escha_silt         = nil,          -- last Escha Silt balance seen in an incoming 0x118
+    currency_asked_at  = nil,          -- os.time() of the last outgoing 0x115 request
     bonus_seen         = {},           -- alternate-spawn names already announced this visit
     arena_positioned   = false,
     facing_settled     = false,        -- one-tick turn-then-wait latch before the first engage packet
@@ -307,6 +341,30 @@ local nexttime = os.clock()
 local delay    = 0
 
 -- ==========================================================================
+-- ESCHA BEADS / SILT (Currency Info 2)
+-- ==========================================================================
+-- The server only reports Escha Beads/Silt in the incoming 0x118 "Currency
+-- Info 2" packet, which it sends in reply to an outgoing 0x115 request (the
+-- client sends the same thing when you open the Currencies 2 menu). The
+-- 'incoming chunk' handler below stores the values in state; this just asks.
+local function request_currency_info(reason)
+    local ok, p = pcall(packets.new, 'outgoing', 0x115, {})
+    if not ok or not p then return end
+    packets.inject(p)
+    state.currency_asked_at = os.time()
+    if reason == 'manual' then log('Requested Escha Beads / Silt balance...') end
+end
+
+-- Periodic refresh while running (called from the main loop).
+local function maybe_refresh_currency()
+    if settings.currency_refresh <= 0 then return end
+    local now = os.time()
+    if not state.currency_asked_at or now - state.currency_asked_at >= settings.currency_refresh then
+        request_currency_info('periodic')
+    end
+end
+
+-- ==========================================================================
 -- HUD
 -- ==========================================================================
 local hud = nil
@@ -319,6 +377,18 @@ if texts_success then
         flags  = {bold = true, draggable = true},
     })
     -- Hidden until //df start (avoid rendering at character select).
+end
+
+-- "  (Azi Dahaka 2, Mireu 1)" or '' when nothing has died yet. Sorted so the
+-- HUD line doesn't reshuffle between redraws.
+local function kill_breakdown()
+    local names = {}
+    for name in pairs(state.kill_log) do names[#names + 1] = name end
+    if #names == 0 then return '' end
+    table.sort(names)
+    local parts = {}
+    for _, name in ipairs(names) do parts[#parts + 1] = name .. ' ' .. state.kill_log[name] end
+    return '  (' .. table.concat(parts, ', ') .. ')'
 end
 
 local function update_hud()
@@ -335,8 +405,11 @@ local function update_hud()
         local eng = state.target_name
             and ('\\cs(255,150,150)' .. state.target_name .. '\\cr')
             or  '\\cs(150,150,150)waiting for spawn\\cr'
-        lines[#lines + 1] = '  Engaging: ' .. eng .. '  (kills: ' .. state.kills .. ')'
+        lines[#lines + 1] = '  Engaging: ' .. eng
     end
+    lines[#lines + 1] = '  Kills: \\cs(255,200,100)' .. state.total_kills .. '\\cr' .. kill_breakdown()
+    lines[#lines + 1] = '  Escha Beads: \\cs(180,255,180)' .. (state.escha_beads or '?') .. '\\cr'
+        .. '   Silt: \\cs(180,255,180)' .. (state.escha_silt or '?') .. '\\cr'
     if state.hud_note then
         lines[#lines + 1] = '  \\cs(200,200,200)' .. state.hud_note .. '\\cr'
     end
@@ -717,7 +790,6 @@ local function reset_arena_tracking()
     state.boss_missing_since = nil
     state.target_name        = nil
     state.pending_advance    = false
-    state.kills              = 0
     state.bonus_seen         = {}
     state.facing_settled     = false
 end
@@ -1170,9 +1242,12 @@ local function phase_6_combat(player)
         -- coming.
         state.fighting = false
         state.boss_missing_since = nil
-        state.kills = state.kills + 1
+        local killed = state.target_name or target.boss
+        state.total_kills = state.total_kills + 1
+        state.kill_log[killed] = (state.kill_log[killed] or 0) + 1
         stop_running()
-        log(('%s defeated or despawned. Arena clear.'):format(state.target_name or target.boss))
+        log(('%s defeated or despawned. Arena clear. (kills this session: %d)'):format(killed, state.total_kills))
+        request_currency_info('after kill')   -- beads just changed; refresh the HUD figure
         state.boss_id = nil
         state.target_name = nil
         state.pending_advance = true
@@ -1444,6 +1519,8 @@ windower.register_event('prerender', function()
     nexttime = curtime
     delay = 0.2
 
+    maybe_refresh_currency()
+
     local zone_id = get_zone_id()
     if not zone_id or not res.zones[zone_id] then return end   -- zoning / transition
     local player = windower.ffxi.get_player()
@@ -1637,6 +1714,20 @@ windower.register_event('incoming chunk', function(id, original, modified, injec
         return
     end
 
+    -- Currency Info 2: Escha Beads / Silt for the HUD. Not blocked. Field
+    -- names per Windower's packets/fields.lua ('Escha Beads' @0x4A,
+    -- 'Escha Silt' @0x4C); also fires when the player opens the Currencies
+    -- 2 menu by hand, so a manual look refreshes the HUD as well.
+    if id == 0x118 then
+        local ok, cur = pcall(packets.parse, 'incoming', original)
+        if ok and type(cur) == 'table' then
+            if cur['Escha Beads'] ~= nil then state.escha_beads = cur['Escha Beads'] end
+            if cur['Escha Silt']  ~= nil then state.escha_silt  = cur['Escha Silt']  end
+            update_hud()
+        end
+        return
+    end
+
     if id ~= 0x032 and id ~= 0x034 then return end
     if not state.running then return end
     if state.phase ~= 2 and state.phase ~= 3 and state.phase ~= 9 then return end
@@ -1784,6 +1875,8 @@ local function cmd_status()
     log('Zone   : ' .. zone_name_of(get_zone_id()))
     if state.last_transition then log('Last transition: ' .. state.last_transition) end
     log(('Watchdog recoveries used: %d/%d'):format(state.watchdog_recoveries, settings.watchdog_recoveries))
+    log(('Kills this session: %d%s'):format(state.total_kills, kill_breakdown()))
+    log(('Escha Beads: %s   Silt: %s'):format(tostring(state.escha_beads or '?'), tostring(state.escha_silt or '?')))
     if state.fail_reason then log('Last failure: ' .. state.fail_reason) end
 end
 
@@ -1794,6 +1887,8 @@ local function cmd_help()
     log('  //df resume                          - restart travel for the current target from here')
     log('  //df status                          - print current state')
     log('  //df mark                            - log current x/y as a waypoint')
+    log('  //df beads                           - refresh and print Escha Beads / Silt')
+    log('  //df resetkills                      - zero the session kill counter')
     log('  //df help                            - this text')
 end
 
@@ -1815,6 +1910,17 @@ windower.register_event('addon command', function(...)
 
     elseif cmd == 'status' then
         cmd_status()
+
+    elseif cmd == 'beads' then
+        request_currency_info('manual')
+        log(('Last known -- Escha Beads: %s   Silt: %s'):format(
+            tostring(state.escha_beads or '?'), tostring(state.escha_silt or '?')))
+
+    elseif cmd == 'resetkills' then
+        state.total_kills = 0
+        state.kill_log    = {}
+        update_hud()
+        log('Session kill counter reset.')
 
     elseif cmd == 'mark' then
         local me = windower.ffxi.get_mob_by_target('me')

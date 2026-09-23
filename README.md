@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 11.5
+**Version:** 11.6
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the **Mireu** spawn.
@@ -31,7 +31,7 @@ As of **v11**, Superwarp is used for exactly one thing: the Home Point warps to 
 - **Phase-Specific Watchdog Timers:** 1–3 minutes for rings/menus/approach, 20 minutes for the arena (dragon spawns can take 15+ minutes). Soft-recovers before stopping; the recovery budget refreshes on every zone change.
 - **Stuck Detection:** Monitors position every 12 seconds during movement phases.
 - **Death Recovery:** Detects death (status 2/3 only — never cutscenes), returns to Home Point, and resumes the rotation.
-- **HUD:** Current status, target zone, phase, engaged target name, kill count, and any warnings.
+- **HUD:** Current status, target zone, phase, engaged target name, **session kill tally with a per-target breakdown**, **Escha Beads / Silt balance**, and any warnings.
 
 ---
 
@@ -105,6 +105,11 @@ local settings = {
 ```
 `post_kill_linger` was removed in v11.4: Mireu spawns *instead of* the dragon, never after it, so there is nothing to wait for once the arena target dies.
 
+### HUD
+```lua
+    currency_refresh = 60,   -- seconds between Escha Beads / Silt refresh requests while running (0 = only on start / after kills / //df beads)
+```
+
 ### Resilience
 ```lua
     watchdog_recoveries = 2,    -- soft re-routes the watchdog may attempt before stopping (refreshed per zone change)
@@ -145,8 +150,10 @@ All commands use `//domainfarm` (or the shorthand `//df`).
 | `//df start` (inside Zi'Tah / Ru'Aun) | With no argument, the bot **adopts the DI zone you are standing in** instead of warping out to Reisenjima. |
 | `//df stop` | Halts the bot, clears the active phase, and stops all movement. |
 | `//df resume` | Restarts travel for the **current** target from wherever you are (use after a watchdog stop). |
-| `//df status` | Prints: running/paused, target zone, phase (+ seconds in phase), current zone, last phase transition, watchdog recoveries used, any error. |
+| `//df status` | Prints: running/paused, target zone, phase (+ seconds in phase), current zone, last phase transition, watchdog recoveries used, session kills, Escha Beads / Silt, any error. |
 | `//df mark` | Prints your current X/Y coordinates to the chat log (for building waypoint paths). |
+| `//df beads` | Requests a fresh Escha Beads / Silt balance from the server and prints the last known values. |
+| `//df resetkills` | Zeroes the session kill counter and its per-target breakdown. |
 | `//df help` | Prints the command list. |
 
 If the zone isn't known yet when you type `start` (right after logging in / zoning), the bot waits 2 seconds and retries instead of guessing.
@@ -188,6 +195,20 @@ After Ru'Aun the rotation wraps back to phase 1 (Reisenjima).
 - **Stale-callback guard** — every phase transition bumps a sequence generation; queued menu callbacks from an abandoned sequence (e.g. a watchdog recovery mid-menu) are dropped instead of firing into the wrong phase.
 - **Phase transition log** — `Phase: A -> B (reason)` on every transition; the last one is also shown by `//df status`.
 
+### HUD
+
+```
+  DomainFarm [RUNNING]
+  Target: Azi Dahaka (Escha - Zi'Tah)
+  Action: Arena Combat & Trusts
+  Engaging: Azi Dahaka
+  Kills: 3  (Azi Dahaka 1, Mireu 1, Quetzalcoatl 1)
+  Escha Beads: 1234   Silt: 56789
+```
+
+- **Kills** is a session-wide tally (since `//lua load` or the last `//df resetkills`). It is not reset by `//df stop`, zone changes or rotation legs.
+- **Escha Beads / Silt** come from the game's *Currency Info 2* packet (incoming `0x118`). DomainFarm asks for it (outgoing `0x115`, the same request the client sends when you open the Currencies 2 menu) on start, every `currency_refresh` seconds while running, and right after each kill. Until the first reply arrives the line reads `?`. Opening the Currencies 2 menu by hand also refreshes it.
+
 ---
 
 ## 🧪 Testing
@@ -200,7 +221,7 @@ lua5.1 test_harness.lua
 python3 -c "from lupa import LuaRuntime; LuaRuntime().execute(\"dofile('test_harness.lua')\")"
 ```
 
-It stubs the Windower 4 environment (including Windower's `string:unpack('bN', …)` bit reader used by `df_eschawarp.lua`) and runs **28 scenarios** covering:
+It stubs the Windower 4 environment (including Windower's `string:unpack('bN', …)` bit reader used by `df_eschawarp.lua`) and runs **29 scenarios** covering:
 - Addon + `libs/` load, all commands, nil-guard checks
 - Ring equip/use with missing inventory
 - Menu packet handling (injected, blocked, valid)
@@ -212,7 +233,8 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 - `//df start` with no argument inside a DI zone adopts that zone
 - Reisenjima: **no `sw ew` command is ever sent**; the bot interacts with Shiftrix natively (`0x01A`), and a captured Domain menu starts the native sequence with Option 14
 - `//df resume` after a stop; unrecognized zone → ring escape after the grace period
-- Kill → disengage → immediate rotation advance (no linger), for both the dragon and Mireu
+- Kill → disengage → immediate rotation advance (no linger), for both the dragon and Mireu — and the session kill counter / per-target breakdown surviving the rotation reset and showing on the HUD
+- Escha Beads HUD: `?` before any `0x118`, parsed values after one, injected copies ignored, `//df beads` sends one `0x115`, `//df resetkills` zeroes the tally
 - Sticky targeting (no ping-pong between candidates); Mireu-only spawn → engaged
 
 > **Not verified against a live client** (please test in-game before relying on the bot):
@@ -220,6 +242,7 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 > - The full native packet flow for phases 2, 4 and 10 (ported from Superwarp's `map/escha.lua`; ack-waiting matches the source, but the client has not been observed end-to-end).
 > - Superwarp's exact chat phrasing for the phase-8 "found!" / "Retrying" signals — if it doesn't match, the bot simply falls back to the watchdog.
 > - Waypoint coordinates, arena landing spots, and engage/claim mechanics.
+> - Whether the server answers an *injected* `0x115` with `0x118` (IDs/field offsets checked against Windower's `packets/fields.lua`, not a live client). If it doesn't, the beads line stays `?` until you open the Currencies 2 menu once.
 
 ---
 
@@ -238,7 +261,12 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 
 ## 📝 Changelog
 
-### v11.5 (Current)
+### v11.6 (Current)
+- **Kill counter actually counts now.** `state.kills` was incremented in phase 6 and zeroed in the *same tick* by `advance_rotation()` → `reset_arena_tracking()`; the HUD also only drew it while in phase 6 — exactly the window in which it was always 0. Replaced with a session-wide `total_kills` + per-target `kill_log` that no phase transition touches, shown on the HUD in every phase and by `//df status`; `//df resetkills` clears it.
+- **Escha Beads / Silt on the HUD.** Read from incoming `0x118` (Currency Info 2), requested via outgoing `0x115` on start, every `currency_refresh` seconds (default 60) while running, after each kill, and on `//df beads`. New setting `currency_refresh`; new commands `//df beads`, `//df resetkills`.
+- Harness: 29 scenarios (kill-counter assertions added to the kill/Mireu scenarios; new beads/resetkills scenario).
+
+### v11.5
 - **Fixed mirror-flipped heading.** `heading_of()` was computing `atan2(dy, dx)` — every working Windower movement/follow addon found uses `-atan2(dy, dx)` instead. The unnegated version produces a heading that's mirrored around the east-west axis: correct at 0° and 180°, increasingly wrong elsewhere. This almost certainly explains reports of "still attacking while facing away from the mob". The default `vector` movement mode (which passes `dx/dy` directly to `windower.ffxi.run()`) was never affected — only `turn()` calls (facing before engage, face-then-engage in v11.3) went through `heading_of()`.
 - **Fixed inventory scan.** `item_in_inventory()` iterated with `for i = 1, (contents.max or 0)`, but `get_items()` doesn't return a `.max` field — every real Windower addon uses `ipairs()` over the bag table. Switched to `ipairs()`. Also widened the bag list to include Wardrobe 5–8 (bags 13–16) alongside inventory + Wardrobe 1–4, so rings in newer wardrobes are found. (Note: Wardrobe 5–8 availability depends on a known Windower/private-server inconsistency in client-side vs. server-side unlock detection; if a ring specifically in one of those four bags still isn't found, that's a limitation outside DomainFarm's control.)
 
