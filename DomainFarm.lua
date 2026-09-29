@@ -1,5 +1,5 @@
 --[[
-    DomainFarm v11.6
+    DomainFarm v11.7
     Automated Domain Invasion farming for Windower 4.
 
     Rotation: Reisenjima (Quetzalcoatl) -> Escha-Zi'Tah (Azi Dahaka)
@@ -22,6 +22,19 @@
         is done natively with our own packets. See "v11: dropped the
         Superwarp dependency for..." below for why Home Point warping alone
         was deliberately NOT brought in-house.
+
+    v11.7: two "runs back to the entrance" fixes, one root cause:
+      - Every re-entry into phase 3 (Domain NPC) or phase 9 (Confluence)
+        restarted the fixed terrain-following waypoint walk from waypoint 1,
+        which sits at the zone entrance / Home Point. So (a) after picking
+        "enter Escha" at the Undulating Confluence, phase 10 saw its menu
+        consumed, dropped back to phase 9 and ran toward the Home Point
+        while the zone line was still loading, and (b) each "Domain
+        Invasion not active yet, retry" loop at Affi ran back to the Zi'Tah
+        entrance and then back to Affi. Now: the walk starts at the NEAREST
+        waypoint (skipped entirely if we're already at the last one or
+        already within reach of the NPC), and phase 10 waits out a zoning
+        grace window (settings.zone_line_grace) before ever retrying.
 
     v11.6: two HUD fixes/additions:
       - The kill counter never showed anything but 0. state.kills was
@@ -164,7 +177,7 @@
 
 _addon.name     = 'DomainFarm'
 _addon.author   = 'Zforninja (hardened rewrite)'
-_addon.version  = '11.6'
+_addon.version = '11.7'
 _addon.commands = {'domainfarm', 'df'}
 
 require('logger')
@@ -210,6 +223,15 @@ local settings = {
     -- balance (outgoing 0x115 -> incoming 0x118) while running. 0 = only on
     -- start / after kills / //df beads.
     currency_refresh = 60,
+    -- After an "enter Escha" (phase 10) menu answer, how long to stand
+    -- still waiting for the zone line before assuming it failed and
+    -- re-approaching the Confluence. Zoning itself takes several seconds;
+    -- walking off during it is what used to send the character running
+    -- back toward the Home Point mid-warp.
+    zone_line_grace = 25,
+    -- Skip the fixed terrain-following walk to an NPC entirely when the NPC
+    -- is already visible within this many yalms (we're standing at it).
+    path_skip_range = 10,
     -- Resilience
     watchdog_recoveries = 2,               -- soft re-routes the watchdog may attempt before stopping (refreshed per zone change)
     unknown_zone_grace  = 30,              -- seconds to sit in an unrecognized zone before warping home (0 = never)
@@ -307,6 +329,8 @@ local state = {
     approach_npc       = nil,          -- entity snapshot for phase 2/3/9's shared approach-and-interact
     approach_best_dist = nil,          -- closest approach so far (watchdog progress)
     wp_path_done       = false,        -- phase 3/9: terrain-following waypoint stage complete
+    wp_path_seeded     = false,        -- phase 3/9: start waypoint chosen from our actual position this attempt
+    enter_sent_at      = nil,          -- os.time() the phase 10 "enter Escha" sequence finished (zone-line grace anchor)
     domain_menu        = nil,          -- {npc, zone, menu_id, menu_params} captured in phase 3, consumed in phase 4
     confluence_menu    = nil,          -- {npc, zone, menu_id} captured in phase 9, consumed in phase 10
     elvorseal_sent_at  = nil,          -- os.time() the Elvorseal sequence completed (phase 5 anchor)
@@ -396,8 +420,12 @@ local function update_hud()
     local status_text = state.running and '\\cs(100,255,100)[RUNNING]\\cr'
                                        or '\\cs(255,100,100)[PAUSED]\\cr'
     local target = rotation[state.zone_index]
+    -- Character name in the header so two clients running side by side are
+    -- told apart at a glance (the addon itself keeps no cross-client state).
+    local me = windower.ffxi.get_player()
+    local who = (me and me.name) and (' \\cs(180,180,180)' .. me.name .. '\\cr') or ''
     local lines = {
-        '  DomainFarm ' .. status_text,
+        '  DomainFarm ' .. status_text .. who,
         '  Target: \\cs(100,200,255)' .. (target and target.label or 'None') .. '\\cr',
         '  Action: \\cs(255,255,100)' .. (PHASE_NAMES[state.phase] or 'Unknown') .. '\\cr',
     }
@@ -470,6 +498,10 @@ local function set_phase(p, reason)
             state.domain_menu     = nil
             state.confluence_menu = nil
             state.wp_path_done    = false
+            state.wp_path_seeded  = false
+        end
+        if p == 10 then
+            state.enter_sent_at = nil
         end
         if p ~= 6 then
             state.arena_positioned = false
@@ -1383,8 +1415,56 @@ end
 -- found" crash, since a hardcoded path alone only ever gets you *close*,
 -- not guaranteed within interact range or correctly facing/targeting a
 -- specific live entity.
+--
+-- v11.7: the walk no longer blindly starts at waypoint 1 (the zone entrance
+-- / Home Point). Every re-entry into phase 3 or 9 -- "dragon not ready,
+-- retry", "no menu captured, retry", a soft recovery -- used to send the
+-- character all the way back to the entrance and then back to the NPC it
+-- was already standing next to. On the first tick of each attempt we now
+-- seed the walk from where we physically are: skip it outright if the NPC
+-- is already in reach (settings.path_skip_range) or we're nearest to the
+-- final waypoint, otherwise start from the nearest waypoint.
+local function nearest_waypoint_index(wps, me)
+    local best, best_d2 = 1, math.huge
+    for i, wp in ipairs(wps) do
+        local d2 = (wp.x - me.x)^2 + (wp.y - me.y)^2
+        if d2 < best_d2 then best, best_d2 = i, d2 end
+    end
+    return best, math.sqrt(best_d2)
+end
+
+local function seed_waypoint_path(wps, names, label)
+    local me = windower.ffxi.get_mob_by_target('me')
+    if not me then return false end          -- try again next tick
+    state.wp_path_seeded = true
+
+    local npc = find_first_mob_by_name(names)
+    local npc_dist = npc and math.sqrt(npc.distance or 0) or math.huge
+    local idx, wp_dist = nearest_waypoint_index(wps, me)
+
+    if npc_dist <= settings.path_skip_range or idx == #wps then
+        state.wp_path_done = true
+        log(('Already at %s (npc %.1fy, nearest waypoint %d/%d at %.1fy); skipping the walk.')
+            :format(label or 'the NPC', npc_dist == math.huge and -1 or npc_dist, idx, #wps, wp_dist))
+    else
+        state.waypoint_index = idx
+        state.last_pos = nil
+        if idx > 1 then
+            log(('Resuming the walk to %s from waypoint %d/%d (%.1fy away).'):format(label or 'the NPC', idx, #wps, wp_dist))
+        end
+    end
+    return true
+end
+
 local function approach_via_waypoints_then_interact(wps, names, label)
     if wps and not state.wp_path_done then
+        if not state.wp_path_seeded then
+            if not seed_waypoint_path(wps, names, label) then return end
+            if state.wp_path_done then
+                approach_and_interact(names)
+                return
+            end
+        end
         if executeArenaPath(wps, label) then
             state.wp_path_done = true
             state.last_pos = nil
@@ -1417,7 +1497,20 @@ local function phase_10_enter_escha_menu()
     if state.seq_busy then return end   -- enter sequence already in flight
     local menu = state.confluence_menu
     if not menu then
-        set_phase(9, 'no confluence menu captured; retrying interaction')
+        -- The menu is consumed the moment the enter sequence is fired, and
+        -- the zone line takes several seconds to land. Until v11.7 this
+        -- branch dropped straight back to phase 9 and re-walked the path
+        -- from the Home Point WHILE the warp was resolving. Stand still for
+        -- the grace window first; the zone-change event / reality router
+        -- takes over the instant we actually arrive in Escha.
+        if state.enter_sent_at and os.time() - state.enter_sent_at < settings.zone_line_grace then
+            stop_running()
+            state.hud_note = 'Entering Escha - waiting for the zone line...'
+            delay = 1
+            return
+        end
+        set_phase(9, state.enter_sent_at and 'enter sequence sent but no zone line; retrying interaction'
+                                          or 'no confluence menu captured; retrying interaction')
         return
     end
     state.confluence_menu = nil
@@ -1426,6 +1519,7 @@ local function phase_10_enter_escha_menu()
     local seq = eschawarp.build_enter_sequence(menu)
     run_action_queue(seq, function()
         state.seq_busy = false
+        state.enter_sent_at = os.time()   -- arm the zone-line grace window (see above)
         -- No explicit set_phase here: the reality router picks up the real
         -- zone change on its own once it happens.
     end)
@@ -1449,6 +1543,8 @@ local function watchdog_recover(zone_id)
     state.domain_menu        = nil
     state.confluence_menu    = nil
     state.wp_path_done       = false
+    state.wp_path_seeded     = false
+    state.enter_sent_at      = nil
     state.sw_attempts       = 0
     state.elvorseal_sent_at = nil
 
@@ -1630,6 +1726,8 @@ windower.register_event('zone change', function(new_id, old_id)
     state.domain_menu        = nil
     state.confluence_menu    = nil
     state.wp_path_done       = false
+    state.wp_path_seeded     = false
+    state.enter_sent_at      = nil
     state.seq_gen            = state.seq_gen + 1
     state.seq_busy           = false
     state.ack_wait_gen       = nil
@@ -1815,6 +1913,8 @@ local function cmd_start(zone_arg)
     state.domain_menu         = nil
     state.confluence_menu     = nil
     state.wp_path_done        = false
+    state.wp_path_seeded      = false
+    state.enter_sent_at       = nil
     state.sw_signal           = nil
     state.sw_signal_at        = nil
     state.sw_last_sent_at     = nil
