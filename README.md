@@ -1,7 +1,7 @@
 # FFXI Domain Invasion Auto-Farmer (DomainFarm)
 
 **Author:** Zforninja
-**Version:** 11.6
+**Version:** 11.7
 **Platform:** Final Fantasy XI (Windower 4)
 
 A fully automated, state-machine-driven Lua addon for Windower 4 that continuously farms Domain Invasion across all three Escha zones: **Reisenjima**, **Escha - Zi'Tah**, and **Escha - Ru'Aun** — including the **Mireu** spawn.
@@ -96,6 +96,8 @@ local settings = {
     ring_timeout    = 120,     -- seconds before a ring phase is declared failed
     stuck_timeout   = 12,      -- seconds without movement progress = stuck
     zone_settle     = 4,       -- seconds to wait after arriving in a zone before touching entities
+    zone_line_grace = 25,      -- after answering the Confluence's "enter Escha" menu, stand still this long waiting for the zone line before retrying
+    path_skip_range = 10,      -- skip the fixed walk to an NPC entirely when it is already visible within this many yalms
     movement_mode   = 'vector',-- 'vector' = windower.ffxi.run(dx, dy); 'heading' = run(radians)
 ```
 
@@ -179,6 +181,16 @@ If the zone isn't known yet when you type `start` (right after logging in / zoni
 
 After Ru'Aun the rotation wraps back to phase 1 (Reisenjima).
 
+### Running two characters at once (two Windower instances)
+
+Safe. Each Windower client loads its own copy of the addon in its own Lua state, and DomainFarm keeps **no shared state of any kind**: it writes no settings/log files, uses no Windower IPC, and every command it issues (`windower.send_command`, packet injection, Superwarp `sw hp ...`) goes to the client it is loaded in. Two instances cannot see or interfere with each other. Things worth knowing anyway:
+
+- **In-game, they are just two players.** Domain Invasion is open-world: both characters can hold Elvorseal, both can fight the same dragon, and both get their own Escha Beads. The only "conflict" is the normal one — the character that claims first owns the claim; the other still contributes damage and receives its own rewards under Domain Invasion rules.
+- **Use one target per character or the same — either works.** `//df start zitah` in both windows is fine; so is staggering them (`reisenjima` in one, `zitah` in the other).
+- **HUD** — since v11.7 the header shows the character name (`DomainFarm [RUNNING] Charname`) so the two overlays are easy to tell apart. Both draw at the same default screen position; that's purely cosmetic per window.
+- **Superwarp** must be loaded in *each* client (it is only used for the Home Point warps to Qufim / Misareaux).
+- Not verified with two live clients by the author of this rewrite; the statements above follow from the code (no file/IPC/global-state access) and the harness, not from a dual-box session.
+
 ### Emergency: Death Recovery
 
 | Phase | Name | Watchdog | What Happens |
@@ -191,6 +203,8 @@ After Ru'Aun the rotation wraps back to phase 1 (Reisenjima).
 - **Post-zone settle** — a 4-second cooldown after any zone change while the client loads its entity table.
 - **Phase watchdog** — per-phase timeouts (table above). Timer refreshes on *real progress* (waypoint reached, closing distance). On trip: **soft recovery** re-derives the phase from where you physically are, up to `watchdog_recoveries` times — and that budget resets every time you actually change zones, so a hiccup in Qufim and another in Zi'Tah don't add up to a hard stop. `//df resume` picks it back up after a stop.
 - **Stuck detection** — position progress checked every 12 seconds during movement.
+- **Resume-from-where-you-are pathing** — the fixed terrain-following walks to the Domain NPC (phase 3) and the Undulating Confluence (phase 9) start from the waypoint *nearest to you*, and are skipped outright when the NPC is already within `path_skip_range`. A retry ("dragon not ready", "no menu captured", a soft recovery) therefore stays put at the NPC instead of running back to the zone entrance first.
+- **Zone-line grace** — after the "enter Escha" menu answer is sent, the bot stands still for `zone_line_grace` seconds waiting for the zone line rather than immediately re-approaching the Confluence (which used to make it run toward the Home Point while the warp was resolving).
 - **Zone reality enforcement** — the router checks the current zone *against the current target* every tick. Wrong DI zone / crag / conflux → escape via **Dim. Ring** (target Reisenjima) or **Warp Ring** (target Zi'Tah / Ru'Aun), then restart travel. Unrecognized zones escape after `unknown_zone_grace` seconds.
 - **Stale-callback guard** — every phase transition bumps a sequence generation; queued menu callbacks from an abandoned sequence (e.g. a watchdog recovery mid-menu) are dropped instead of firing into the wrong phase.
 - **Phase transition log** — `Phase: A -> B (reason)` on every transition; the last one is also shown by `//df status`.
@@ -221,7 +235,7 @@ lua5.1 test_harness.lua
 python3 -c "from lupa import LuaRuntime; LuaRuntime().execute(\"dofile('test_harness.lua')\")"
 ```
 
-It stubs the Windower 4 environment (including Windower's `string:unpack('bN', …)` bit reader used by `df_eschawarp.lua`) and runs **29 scenarios** covering:
+It stubs the Windower 4 environment (including Windower's `string:unpack('bN', …)` bit reader used by `df_eschawarp.lua`) and runs **32 scenarios** covering:
 - Addon + `libs/` load, all commands, nil-guard checks
 - Ring equip/use with missing inventory
 - Menu packet handling (injected, blocked, valid)
@@ -236,6 +250,7 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 - Kill → disengage → immediate rotation advance (no linger), for both the dragon and Mireu — and the session kill counter / per-target breakdown surviving the rotation reset and showing on the HUD
 - Escha Beads HUD: `?` before any `0x118`, parsed values after one, injected copies ignored, `//df beads` sends one `0x115`, `//df resetkills` zeroes the tally
 - Sticky targeting (no ping-pong between candidates); Mireu-only spawn → engaged
+- Re-path fixes: standing at Affi, a "dragon not ready" retry re-interacts in place (no run back to the entrance); halfway along the Qufim path the walk resumes toward the *next* waypoint; after the "enter Escha" answer the bot stands still for the zone-line grace window, then retries only if no zone line came
 
 > **Not verified against a live client** (please test in-game before relying on the bot):
 > - `read_domain_status()` bit offsets (dragon-up / Elvorseal-active) in the Domain NPC menu parameters.
@@ -261,7 +276,12 @@ It stubs the Windower 4 environment (including Windower's `string:unpack('bN', �
 
 ## 📝 Changelog
 
-### v11.6 (Current)
+### v11.7 (Current)
+- **Fix: running back to the zone entrance / Home Point.** Every re-entry into phase 3 (Domain NPC) or phase 9 (Confluence) restarted the fixed waypoint walk from waypoint 1, which sits at the zone entrance. Two visible symptoms: (a) after picking "enter Escha" at the Undulating Confluence, phase 10 dropped straight back to phase 9 and the character ran toward the Home Point while the zone line was still loading; (b) each "Domain Invasion not active yet, retry" at Affi ran back to the Zi'Tah entrance and then back to Affi. The walk now starts from the nearest waypoint (or is skipped when already at the NPC), and phase 10 waits out a `zone_line_grace` window (default 25 s) before retrying.
+- New settings `zone_line_grace`, `path_skip_range`.
+- Harness: 32 scenarios (three new re-path scenarios; the first one fails against v11.6 and passes against v11.7).
+
+### v11.6
 - **Kill counter actually counts now.** `state.kills` was incremented in phase 6 and zeroed in the *same tick* by `advance_rotation()` → `reset_arena_tracking()`; the HUD also only drew it while in phase 6 — exactly the window in which it was always 0. Replaced with a session-wide `total_kills` + per-target `kill_log` that no phase transition touches, shown on the HUD in every phase and by `//df status`; `//df resetkills` clears it.
 - **Escha Beads / Silt on the HUD.** Read from incoming `0x118` (Currency Info 2), requested via outgoing `0x115` on start, every `currency_refresh` seconds (default 60) while running, after each kill, and on `//df beads`. New setting `currency_refresh`; new commands `//df beads`, `//df resetkills`.
 - Harness: 29 scenarios (kill-counter assertions added to the kill/Mireu scenarios; new beads/resetkills scenario).

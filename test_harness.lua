@@ -623,6 +623,93 @@ print('== Escha Beads HUD + resetkills OK ==')
 cmd('stop')
 print('== ALL v11.6 RESILIENCE TESTS PASSED ==')
 
+-- 30. (v11.7) Standing AT Affi when phase 3 is re-entered ("dragon not ready,
+--     retry") must NOT re-walk the fixed path from the Zi'Tah entrance.
+--     Before v11.7 every set_phase(3) reset waypoint_index to 1, i.e. the
+--     character ran back to the zone entrance and then back to Affi.
+cmd('stop')
+world.zone = 288; world.player.buffs = {}
+world.me = {x = -355.0, y = -171.0, z = 0}          -- next to the last zitah waypoint / Affi
+world.mobs = {[9100] = {id=9100, index=91, name='Affi', valid_target=true, x=-356, y=-171, distance=4}}
+world.sent_commands = {}; world.injected = {}; world.last_run = nil
+cmd('start', 'zitah')
+tick(1, 5); tick(1, 5); tick(2, 1)                    -- settle, then phase 3
+local ran_off = false
+if world.last_run and world.last_run[1] ~= false then
+    -- any run() call here would be toward waypoint 1 at (-345,-179): +x direction
+    if world.last_run[1] > 0 then ran_off = true end
+end
+assert(not ran_off, 'phase 3 must not run back toward the entrance waypoint when already at Affi')
+local talked = 0
+for _, p in ipairs(world.injected) do
+    if p.id == 0x01A and p.fields['Target'] == 9100 then talked = talked + 1 end
+end
+assert(talked >= 1, 'already at Affi: must interact right away (path skipped)')
+-- "Domain Invasion not active" menu -> cancel -> back to phase 3 -> must still not walk off.
+world.last_run = nil; world.injected = {}
+local params_off = string.char(0, 0, 0, 0, 0, 0, 0, 0)
+events['incoming chunk'](0x034, {NPC=9100, ['Menu ID']=9002, Zone=288, ['Menu Parameters']=params_off}, nil, false, false)
+tick(1, 6)                                            -- phase 4: not ready -> set_phase(3), delay = elvorseal_retry
+tick(3, 30)                                           -- past the retry delay: phase 3 again
+assert(world.last_run == nil or world.last_run[1] == false,
+       'retry at Affi must not re-walk the path from the entrance')
+talked = 0
+for _, p in ipairs(world.injected) do
+    if p.id == 0x01A and p.fields['Target'] == 9100 then talked = talked + 1 end
+end
+assert(talked >= 1, 'retry at Affi must re-interact in place')
+print('== retry at Domain NPC stays put (no entrance re-walk) OK ==')
+
+-- 31. (v11.7) Nearest-waypoint resume: halfway along the Qufim path, phase 9
+--     must continue from the nearest waypoint rather than waypoint 1.
+cmd('stop')
+world.zone = 126; world.player.buffs = {}
+world.me = {x = -203.5, y = 84.0, z = 0}            -- on top of q_waypoints[3]
+world.mobs = {}                                     -- confluence not in tracking range yet
+world.sent_commands = {}; world.injected = {}; world.last_run = nil
+cmd('start', 'zitah')
+tick(1, 5); tick(1, 5); tick(2, 1)
+assert(world.last_run and world.last_run[1] ~= false, 'phase 9 must be walking')
+-- Toward waypoint 4 (-201.26, 81.52): dx > 0, dy < 0. Toward waypoint 1 (-212, 94): dx < 0, dy > 0.
+assert(world.last_run[1] > 0 and world.last_run[2] < 0,
+       'phase 9 must resume toward the NEXT waypoint, not run back to waypoint 1 at the Home Point')
+print('== nearest-waypoint resume OK ==')
+
+-- 32. (v11.7) Phase 10: after the "enter Escha" answer is sent, the bot must
+--     stand still for the zone-line grace window instead of dropping to
+--     phase 9 and running back toward the Home Point mid-warp.
+cmd('stop')
+world.zone = 126; world.player.buffs = {}
+world.me = {x = -203.0, y = 78.0, z = 0}            -- at the confluence
+world.mobs = {[9200] = {id=9200, index=92, name='Undulating Confluence', valid_target=true, x=-203, y=77, distance=1}}
+world.sent_commands = {}; world.injected = {}; world.last_run = nil
+cmd('start', 'zitah')
+tick(1, 5); tick(1, 5); tick(2, 1)                    -- phase 9: path skipped, interact
+local hit = false
+for _, p in ipairs(world.injected) do
+    if p.id == 0x01A and p.fields['Target'] == 9200 then hit = true end
+end
+assert(hit, 'at the confluence: must interact immediately')
+events['incoming chunk'](0x034, {NPC=9200, ['Menu ID']=9003, Zone=126}, nil, false, false)   -- -> phase 10
+world.last_run = nil
+tick(1, 6)                                            -- fires the enter sequence (queue runs immediately in the harness)
+tick(5, 2)                                            -- 10s after: still in Qufim (zone line pending)
+assert(world.last_run == nil or world.last_run[1] == false,
+       'must stand still during the zone-line grace window, not run toward the Home Point')
+assert(world.hud_text:find('waiting for the zone line', 1, true), 'HUD must say we are waiting for the zone line')
+-- Zone line never comes: after the grace window we DO retry the confluence.
+world.injected = {}
+tick(3, 10)
+hit = false
+for _, p in ipairs(world.injected) do
+    if p.id == 0x01A and p.fields['Target'] == 9200 then hit = true end
+end
+assert(hit, 'after the grace window the confluence must be re-approached')
+print('== phase 10 zone-line grace OK ==')
+
+cmd('stop')
+print('== ALL v11.7 RE-PATH TESTS PASSED ==')
+
 -- 13. stop resets cleanly
 cmd('stop'); cmd('status')
 events['unload']()
